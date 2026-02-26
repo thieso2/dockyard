@@ -1165,7 +1165,7 @@ cmd_verify() {
 
     # 4. basic container run
     out=$(DOCKER_HOST="$_s" "$_d" run --rm alpine echo verify-ok 2>&1)
-    if [ "$out" = "verify-ok" ]; then
+    if echo "$out" | grep -q "verify-ok"; then
         _pass "container run (alpine echo)"
     else
         _fail "container run" "$out"
