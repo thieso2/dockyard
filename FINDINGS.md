@@ -260,21 +260,34 @@ The cleanup test checked `ip link show dy2_docker0` and parsed the output for "d
 
 ---
 
-## verify: DinD check false-positive when alpine image not cached
+## verify: exact-match checks fail when alpine image not cached
 
 **Date**: 2026-02-26
-**Severity**: Test false-positive — `verify` reported FAIL on working DinD
-**Status**: RESOLVED — `src/18_verify.sh`
+**Severity**: Test false-positive — `verify` reported FAIL on working instances
+**Status**: RESOLVED — `src/18_verify.sh` (two separate fixes)
 
-`cmd_verify` ran `docker exec $cname docker run --rm alpine echo dind-ok` and checked the output with:
+Both the basic container run check (check 4) and the DinD inner container check (check 6) used exact-string match against the expected output:
 
 ```bash
+# check 4
+out=$(... docker run --rm alpine echo verify-ok 2>&1)
+if [ "$out" = "verify-ok" ]; then
+
+# check 6
+out=$(... docker exec "$cname" docker run --rm alpine echo dind-ok 2>&1)
 if [ "$out" = "dind-ok" ]; then
 ```
 
-When the alpine image was not cached inside the DinD container, docker pull progress lines appeared in stdout alongside `dind-ok`. The exact-string match failed even though the inner container worked correctly.
+When the alpine image is not cached — either in the outer daemon (check 4) or inside the DinD container (check 6) — docker pull progress lines appear in stdout alongside the expected string. The exact-string match fails even though the container ran correctly.
 
-**Fix**: Replace `[ "$out" = "dind-ok" ]` with `echo "$out" | grep -q "dind-ok"`.
+The DinD check was fixed first (noticed on 100.106.185.92 where the image was cold). The basic container run check was caught later when running on sandman with a freshly created instance.
+
+**Fix**: Replace both exact matches with `echo "$out" | grep -q "..."`:
+
+```bash
+if echo "$out" | grep -q "verify-ok"; then
+if echo "$out" | grep -q "dind-ok"; then
+```
 
 ---
 
