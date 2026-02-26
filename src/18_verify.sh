@@ -65,6 +65,10 @@ cmd_verify() {
             sleep 2
         done
         if $ready; then
+            # Preload alpine from host cache to avoid Docker Hub rate limits.
+            if [ -f /var/tmp/alpine.tar ]; then
+                DOCKER_HOST="$_s" "$_d" exec -i "$cname" docker load < /var/tmp/alpine.tar >/dev/null 2>&1 || true
+            fi
             out=$(DOCKER_HOST="$_s" "$_d" exec "$cname" docker run --rm alpine echo dind-ok 2>&1)
             if echo "$out" | grep -q "dind-ok"; then
                 _pass "Docker-in-Docker (inner container via sysbox)"

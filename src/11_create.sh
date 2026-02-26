@@ -61,6 +61,12 @@ cmd_create() {
     local SYSBOX_VERSION="0.6.7.9-tc"
     local SYSBOX_TARBALL="sysbox-static-x86_64.tar.gz"
 
+    # SHA256 checksums — must match exactly; cache hits are also verified
+    # (protects against cache poisoning and mirror tampering)
+    local DOCKER_SHA256="995b1d0b51e96d551a3b49c552c0170bc6ce9f8b9e0866b8c15bbc67d1cf93a3"
+    local DOCKER_ROOTLESS_SHA256="8c7b7783d8b391ca3183d9b5c7dea1794f6de69cfaa13c45f61fcd17d2b9c3ef"
+    local SYSBOX_SHA256="19d15409897cae94e94341265dc16e5fa9c2d2aeca9bc63d5356f54423d24fbb"
+
     local DOCKER_URL="https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz"
     local DOCKER_ROOTLESS_URL="https://download.docker.com/linux/static/stable/x86_64/docker-rootless-extras-${DOCKER_ROOTLESS_VERSION}.tgz"
     local SYSBOX_URL="https://github.com/thieso2/sysbox/releases/download/v${SYSBOX_VERSION}/${SYSBOX_TARBALL}"
@@ -120,8 +126,22 @@ cmd_create() {
         fi
     fi
 
+    verify_checksum() {
+        local file="$1" expected="$2" name="$3"
+        local actual
+        actual=$(sha256sum "$file" | awk '{print $1}')
+        if [ "$actual" != "$expected" ]; then
+            echo "Error: SHA256 mismatch for $name" >&2
+            echo "  expected: $expected" >&2
+            echo "  got:      $actual" >&2
+            rm -f "$file"
+            exit 1
+        fi
+    }
+
     download() {
         local url="$1"
+        local expected_sha256="$2"
         local dest="${CACHE_DIR}/$(basename "$url")"
         if [ -f "$dest" ]; then
             echo "  cached: $(basename "$dest")"
@@ -129,12 +149,13 @@ cmd_create() {
             echo "  downloading: $(basename "$url")"
             curl -fsSL -o "${dest}.tmp" "$url" && mv "${dest}.tmp" "$dest"
         fi
+        verify_checksum "$dest" "$expected_sha256" "$(basename "$url")"
     }
 
     echo "Downloading artifacts..."
-    download "$DOCKER_URL"
-    download "$DOCKER_ROOTLESS_URL"
-    download "$SYSBOX_URL"
+    download "$DOCKER_URL"          "$DOCKER_SHA256"
+    download "$DOCKER_ROOTLESS_URL" "$DOCKER_ROOTLESS_SHA256"
+    download "$SYSBOX_URL"          "$SYSBOX_SHA256"
 
     # Use per-PID staging dirs for extraction so concurrent creates don't race
     # on a shared extraction directory (all instances share the same CACHE_DIR).

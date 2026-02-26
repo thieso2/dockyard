@@ -370,6 +370,12 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 		d := time.Since(start)
 		if allOK(rs) {
 			pass(7, "all instances: container run", d)
+			// Save alpine:latest to host cache so DinD tests can load it without
+			// hitting Docker Hub unauthenticated pull rate limits.
+			run(client, fmt.Sprintf(
+				"sudo DOCKER_HOST=unix://%s docker save alpine:latest > /var/tmp/alpine.tar",
+				allInstances[0].Socket,
+			))
 		} else {
 			fail(7, "all instances: container run", failMsgs(rs), d)
 		}
@@ -433,6 +439,11 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 			for i := 0; i < 60; i++ {
 				_, _, c2 := run(c, fmt.Sprintf("sudo DOCKER_HOST=unix://%s docker exec %s docker info", inst.Socket, cname))
 				if c2 == 0 {
+					// Preload alpine from host cache into inner docker to avoid pull rate limits.
+					run(c, fmt.Sprintf(
+						"sudo DOCKER_HOST=unix://%s docker exec -i %s docker load < /var/tmp/alpine.tar",
+						inst.Socket, cname,
+					))
 					return true, ""
 				}
 				time.Sleep(2 * time.Second)
@@ -724,14 +735,23 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 	}
 
 	// 22 — post-reboot: B+C docker services active (concurrent)
+	// Retry for up to 90s: cold boot on slow hosts means ExecStartPost (API readiness poll)
+	// may still be running when SSH becomes available, causing the service to be in
+	// "activating (start-post)" until docker accepts connections.
 	{
 		start := time.Now()
 		rs = forAll(client, surviving, func(c *ssh.Client, inst Instance) (bool, string) {
-			_, _, c1 := run(c, "systemctl is-active "+inst.Prefix+"docker")
-			if c1 != 0 {
-				return false, inst.Prefix + "docker not active"
+			deadline := time.Now().Add(90 * time.Second)
+			for {
+				_, _, c1 := run(c, "systemctl is-active "+inst.Prefix+"docker")
+				if c1 == 0 {
+					return true, ""
+				}
+				if time.Now().After(deadline) {
+					return false, inst.Prefix + "docker not active"
+				}
+				time.Sleep(2 * time.Second)
 			}
-			return true, ""
 		})
 		d := time.Since(start)
 		if allOK(rs) {
@@ -794,6 +814,11 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 				_, _, c2 := run(c, fmt.Sprintf("sudo DOCKER_HOST=unix://%s docker exec %s docker info", inst.Socket, cname))
 				if c2 == 0 {
 					ready = true
+					// Preload alpine from host cache into inner docker to avoid pull rate limits.
+					run(c, fmt.Sprintf(
+						"sudo DOCKER_HOST=unix://%s docker exec -i %s docker load < /var/tmp/alpine.tar",
+						inst.Socket, cname,
+					))
 					break
 				}
 				time.Sleep(2 * time.Second)
@@ -937,6 +962,8 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 		}
 
 		if nestedOK {
+			// Preload alpine from host cache to avoid Docker Hub rate limits.
+			run(client, fmt.Sprintf("sudo DOCKER_HOST=unix://%s docker load < /var/tmp/alpine.tar", nestedSocket))
 			out, se, code := run(client, fmt.Sprintf(
 				"sudo DOCKER_HOST=unix://%s docker run --rm alpine echo nested-ok",
 				nestedSocket,

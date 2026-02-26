@@ -30,6 +30,7 @@ Examples:
   ./dockyard.sh status
   sudo ./dockyard.sh verify
   sudo ./dockyard.sh destroy
+  sudo ./dockyard.sh destroy --keep-data   # preserve container data
 
   # Multiple instances
   DOCKYARD_DOCKER_PREFIX=test_ DOCKYARD_ROOT=/test ./dockyard.sh gen-env

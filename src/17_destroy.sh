@@ -1,9 +1,11 @@
 cmd_destroy() {
     local YES=false
+    local KEEP_DATA=false
     for arg in "$@"; do
         case "$arg" in
-            --yes|-y) YES=true ;;
-            -h|--help) usage ;;
+            --yes|-y)       YES=true ;;
+            --keep-data|-k) KEEP_DATA=true ;;
+            -h|--help)      usage ;;
         esac
     done
 
@@ -11,9 +13,21 @@ cmd_destroy() {
 
     local SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
-    echo "This will remove all installed dockyard docker files:"
-    echo "  ${SERVICE_FILE}    (docker systemd service)"
-    echo "  ${DOCKYARD_ROOT}/  (all instance data: binaries, config, data, logs, sockets)"
+    if [[ "$KEEP_DATA" == true ]]; then
+        echo "This will remove the dockyard instance (binaries and config only — data preserved):"
+        echo "  ${SERVICE_FILE}"
+        echo "  ${DOCKYARD_ROOT}/  (except ${DOCKER_DATA}/)"
+    else
+        echo "This will remove all installed dockyard docker files:"
+        echo "  ${SERVICE_FILE}    (docker systemd service)"
+        echo "  ${DOCKYARD_ROOT}/  (all instance data: binaries, config, data, logs, sockets)"
+        local data_size
+        data_size=$(du -sh "${DOCKER_DATA}" 2>/dev/null | cut -f1 || echo "unknown")
+        echo ""
+        echo "Warning: this will permanently delete container data:"
+        echo "  ${DOCKER_DATA}/  (~${data_size})"
+        echo "  Use --keep-data (-k) to preserve container data."
+    fi
     echo ""
     if [[ "$YES" != true ]]; then
         read -p "Continue? [y/N] " confirm
@@ -71,10 +85,21 @@ cmd_destroy() {
         echo "Removed AppArmor fusermount3 entry for ${DOCKYARD_DOCKER_PREFIX}"
     fi
 
-    # --- 3. Remove instance root (all state: binaries, config, data, logs, sockets) ---
+    # --- 3. Remove instance root (selective or full) ---
     if [ -d "$DOCKYARD_ROOT" ]; then
-        rm -rf "$DOCKYARD_ROOT"
-        echo "Removed ${DOCKYARD_ROOT}/"
+        if [[ "$KEEP_DATA" == true ]]; then
+            rm -rf "${DOCKYARD_ROOT}/bin"
+            rm -rf "${DOCKYARD_ROOT}/etc"
+            rm -rf "${DOCKYARD_ROOT}/log"
+            rm -rf "${DOCKYARD_ROOT}/run"
+            rm -rf "${DOCKYARD_ROOT}/lib/sysbox"
+            rm -rf "${DOCKYARD_ROOT}/lib/docker-config"
+            echo "Removed instance files from ${DOCKYARD_ROOT}/"
+            echo "Data preserved at ${DOCKER_DATA}"
+        else
+            rm -rf "$DOCKYARD_ROOT"
+            echo "Removed ${DOCKYARD_ROOT}/"
+        fi
     fi
 
     # --- 4. Remove instance user and group ---
