@@ -47,7 +47,7 @@ cmd_create() {
     #   called for sandbox containers, so this version does NOT trigger the
     #   sysbox procfs incompatibility (nestybox/sysbox#973).
     #
-    # SYSBOX_VERSION: 0.6.7.9-tc is a patched fork (github.com/thieso2/sysbox)
+    # SYSBOX_VERSION: 0.6.7.10-tc is a patched fork (github.com/thieso2/sysbox)
     #   that adds --run-dir to sysbox-mgr, sysbox-fs, and sysbox-runc, allowing
     #   N independent sysbox instances per host (each with its own socket dir).
     #   SetRunDir() calls os.Setenv("SYSBOX_RUN_DIR", dir) and os.Args is scanned
@@ -56,19 +56,41 @@ cmd_create() {
     #   No wrapper script needed.
     #   Fixed: https://github.com/thieso2/sysbox/issues/5
     #   Distributed as a static tarball (no .deb, no dpkg dependency).
+    #   0.6.7.10-tc is the first release with an aarch64 static tarball.
+
+    # --- Detect CPU architecture ---
+    local ARCH
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        x86_64|aarch64) ;;
+        *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
+    esac
+    echo "  arch:        ${ARCH}"
+    echo ""
+
     local DOCKER_VERSION="29.2.1"
     local DOCKER_ROOTLESS_VERSION="29.2.1"
-    local SYSBOX_VERSION="0.6.7.9-tc"
-    local SYSBOX_TARBALL="sysbox-static-x86_64.tar.gz"
+    local SYSBOX_VERSION="0.6.7.10-tc"
+    local SYSBOX_TARBALL="sysbox-static-${ARCH}.tar.gz"
 
     # SHA256 checksums — must match exactly; cache hits are also verified
     # (protects against cache poisoning and mirror tampering)
-    local DOCKER_SHA256="995b1d0b51e96d551a3b49c552c0170bc6ce9f8b9e0866b8c15bbc67d1cf93a3"
-    local DOCKER_ROOTLESS_SHA256="8c7b7783d8b391ca3183d9b5c7dea1794f6de69cfaa13c45f61fcd17d2b9c3ef"
-    local SYSBOX_SHA256="19d15409897cae94e94341265dc16e5fa9c2d2aeca9bc63d5356f54423d24fbb"
+    local DOCKER_SHA256 DOCKER_ROOTLESS_SHA256 SYSBOX_SHA256
+    case "$ARCH" in
+        x86_64)
+            DOCKER_SHA256="995b1d0b51e96d551a3b49c552c0170bc6ce9f8b9e0866b8c15bbc67d1cf93a3"
+            DOCKER_ROOTLESS_SHA256="8c7b7783d8b391ca3183d9b5c7dea1794f6de69cfaa13c45f61fcd17d2b9c3ef"
+            SYSBOX_SHA256="9107dca08cc69c5871a0be7981dec3a3e8e5aa6e0924b7a6ca36df324357274b"
+            ;;
+        aarch64)
+            DOCKER_SHA256="236c5064473295320d4bf732fbbfc5b11b6b2dc446e8bc7ebb9222015fb36857"
+            DOCKER_ROOTLESS_SHA256="15895df8b46ff33179d357e61b600b5b51242f9b9587c0f66695689e62f57894"
+            SYSBOX_SHA256="6a543f863cf77cbec285f9eebbbe5d5e5c0f3fd3836347909b4ef1e4b3fc03ef"
+            ;;
+    esac
 
-    local DOCKER_URL="https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz"
-    local DOCKER_ROOTLESS_URL="https://download.docker.com/linux/static/stable/x86_64/docker-rootless-extras-${DOCKER_ROOTLESS_VERSION}.tgz"
+    local DOCKER_URL="https://download.docker.com/linux/static/stable/${ARCH}/docker-${DOCKER_VERSION}.tgz"
+    local DOCKER_ROOTLESS_URL="https://download.docker.com/linux/static/stable/${ARCH}/docker-rootless-extras-${DOCKER_ROOTLESS_VERSION}.tgz"
     local SYSBOX_URL="https://github.com/thieso2/sysbox/releases/download/v${SYSBOX_VERSION}/${SYSBOX_TARBALL}"
 
     mkdir -p "$LOG_DIR" "$RUN_DIR" "$ETC_DIR" "$BIN_DIR"

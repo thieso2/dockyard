@@ -6,6 +6,34 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Dockyard: multi-instance Docker daemon installer with sysbox-runc as default runtime. Runs isolated Docker instances side-by-side with the system Docker on the same host. Each instance gets its own bridge network, containerd, socket, and data directory.
 
+## Building
+
+```bash
+# Build dist/dockyard.sh from src/*.sh (concatenates in numeric order, strips per-file shebangs)
+./build.sh
+
+# Build the integration test binary (run from repo root)
+GOOS=linux GOARCH=amd64 go build -o cmd/dockyardtest/dockyardtest_linux ./cmd/dockyardtest/
+GOOS=linux GOARCH=arm64 go build -o cmd/dockyardtest/dockyardtest_linux_arm64 ./cmd/dockyardtest/
+GOOS=darwin GOARCH=arm64 go build -o cmd/dockyardtest/dockyardtest_mac ./cmd/dockyardtest/
+```
+
+The `dockyard.sh` at the repo root is the working copy (not a symlink). `dist/dockyard.sh` is the built output. Edit `src/*.sh` and run `./build.sh` — never edit `dist/dockyard.sh` directly.
+
+## Running the Integration Tests
+
+The test suite (`cmd/dockyardtest/main.go`) SSHes into a remote Linux VM and runs 29 end-to-end tests across 3 dockyard instances.
+
+```bash
+# Upload dist + binary to target host, then run
+./dockyardtest_mac --host HOST --user thies [--key /path/to/key]
+
+# Run a specific test by name (substring match on test subject)
+./dockyardtest_mac --host HOST --user thies --run "verify"
+```
+
+See MEMORY.md for known test VM addresses and cross-host SSH key setup.
+
 ## Key Commands
 
 ```bash
@@ -93,7 +121,7 @@ Defined in `cmd_create()`, cached in `.tmp/`:
 |----------|---------|--------|
 | Docker CE (static) | 29.2.1 | download.docker.com |
 | Docker Rootless Extras | 29.2.1 | download.docker.com |
-| Sysbox (fork, static tarball) | 0.6.7.9-tc | github.com/thieso2/sysbox |
+| Sysbox (fork, static tarball) | 0.6.7.10-tc | github.com/thieso2/sysbox |
 
 The fork ships as a static tarball containing all three binaries (`sysbox-mgr`, `sysbox-fs`, `sysbox-runc`).
 
@@ -186,14 +214,23 @@ ${DOCKYARD_ROOT}/                        # owned by ${INSTANCE_USER}:${INSTANCE_
 
 ## Key Files
 
-- `src/01_env.sh` — `derive_vars()` with FHS-aligned paths, `SYSBOX_RUN_DIR`, `SYSBOX_DATA_DIR`, `INSTANCE_USER`, `INSTANCE_GROUP`
+- `build.sh` — concatenates `src/[0-9]*.sh` → `dist/dockyard.sh`; strips only the first-line shebang per file
+- `src/00_header.sh` — shebang + `set -euo pipefail` + SCRIPT_DIR; must remain the first file
+- `src/01_env.sh` — `load_env()` (5-step config discovery) and `derive_vars()` (all derived paths + user/group vars)
+- `src/02_helpers.sh` — `require_root()`, `stop_daemon()`, `wait_for_file()`, `download()` (atomic fetch + SHA256)
+- `src/03_checks.sh` — `check_prefix_conflict()`, `check_root_conflict()`, `check_subnet_conflict()`; shared by gen-env and create
+- `src/10_gen_env.sh` — CIDR randomization, conflict retries, writes `dockyard.env`
 - `src/11_create.sh` — groupadd/useradd, binary install (static tarball, not .deb), chown after install
 - `src/12_enable.sh` — per-instance docker.service with inline sysbox ExecStartPre/ExecStopPost, `--group` flag for dockerd
 - `src/13_disable.sh` — removes docker service only (no shared sysbox service logic)
 - `src/14_start.sh` — starts sysbox-mgr and sysbox-fs inline before containerd/dockerd, `--group` flag
 - `src/15_stop.sh` — stops dockerd, containerd, sysbox-fs, sysbox-mgr in order
-- `src/17_destroy.sh` — `rm -rf DOCKYARD_ROOT`, userdel/groupdel
-- `src/18_verify.sh` — post-install smoke test (service, socket, API, container run, ping, DinD)
+- `src/16_status.sh` — reads PIDs from `run/*.pid`; uses `/proc/$pid` (no root needed)
+- `src/17_destroy.sh` — `rm -rf DOCKYARD_ROOT`, AppArmor block removal, userdel/groupdel
+- `src/18_verify.sh` — post-install smoke test (service, socket, API, container run, ping, DinD); all output checks use `grep -q`
+- `src/90_usage.sh` — help text for each subcommand
+- `src/99_dispatch.sh` — `case "$1"` router; entry point that calls `cmd_*` functions
+- `cmd/dockyardtest/main.go` — Go integration test suite (29 tests, SSH-based, 3 instances)
 - `ARCHITECTURE.md` — comprehensive design doc with mermaid diagrams
 - `FINDINGS.md` — root cause analysis of all discovered issues
 - `PROGRESS.md` — architecture summary and test phase breakdown
