@@ -40,7 +40,7 @@ cmd_start() {
     SYSBOX_MGR_PID=$!
     echo "$SYSBOX_MGR_PID" > "${SYSBOX_RUN_DIR}/sysbox-mgr.pid"
     STARTED_PIDS+=("$SYSBOX_MGR_PID")
-    wait_for_file "${SYSBOX_RUN_DIR}/sysmgr.sock" "sysbox-mgr" 30 || cleanup
+    wait_for_file "${SYSBOX_RUN_DIR}/sysmgr.sock" "sysbox-mgr" 60 || cleanup
     kill -0 "$SYSBOX_MGR_PID" 2>/dev/null || { echo "sysbox-mgr exited unexpectedly" >&2; cleanup; }
     echo "  sysbox-mgr ready (pid ${SYSBOX_MGR_PID})"
 
@@ -50,7 +50,7 @@ cmd_start() {
     SYSBOX_FS_PID=$!
     echo "$SYSBOX_FS_PID" > "${SYSBOX_RUN_DIR}/sysbox-fs.pid"
     STARTED_PIDS+=("$SYSBOX_FS_PID")
-    wait_for_file "${SYSBOX_RUN_DIR}/sysfs.sock" "sysbox-fs" 30 || cleanup
+    wait_for_file "${SYSBOX_RUN_DIR}/sysfs.sock" "sysbox-fs" 60 || cleanup
     kill -0 "$SYSBOX_FS_PID" 2>/dev/null || { echo "sysbox-fs exited unexpectedly" >&2; cleanup; }
     echo "  sysbox-fs ready (pid ${SYSBOX_FS_PID})"
 

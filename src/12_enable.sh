@@ -29,8 +29,8 @@ wait_for_socket() {
             echo "dockyard-stack: \$name exited unexpectedly" >&2
             return 1
         fi
-        if [ "\$i" -ge 30 ]; then
-            echo "dockyard-stack: \$name did not start within 30s" >&2
+        if [ "\$i" -ge 60 ]; then
+            echo "dockyard-stack: \$name did not start within 60s" >&2
             return 1
         fi
     done

@@ -121,6 +121,7 @@ Defined in `cmd_create()`, cached in `.tmp/`:
 |----------|---------|--------|
 | Docker CE (static) | 29.2.1 | download.docker.com |
 | Docker Rootless Extras | 29.2.1 | download.docker.com |
+| Docker Compose v2 | 2.32.4 | github.com/docker/compose |
 | Sysbox (fork, static tarball) | 0.6.7.10-tc | github.com/thieso2/sysbox |
 
 The fork ships as a static tarball containing all three binaries (`sysbox-mgr`, `sysbox-fs`, `sysbox-runc`).

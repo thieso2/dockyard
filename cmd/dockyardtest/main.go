@@ -33,12 +33,13 @@ type Instance struct {
 	Root    string // "/dy1"
 	EnvFile string // "~/dy1.env"
 	Socket  string // "/dy1/run/docker.sock"
+	Docker  string // "/dy1/bin/docker" (wrapper with DOCKER_HOST baked in)
 }
 
 var allInstances = []Instance{
-	{"A", "dy1_", "/dy1", "~/dy1.env", "/dy1/run/docker.sock"},
-	{"B", "dy2_", "/dy2", "~/dy2.env", "/dy2/run/docker.sock"},
-	{"C", "dy3_", "/dy3", "~/dy3.env", "/dy3/run/docker.sock"},
+	{"A", "dy1_", "/dy1", "~/dy1.env", "/dy1/run/docker.sock", "/dy1/bin/docker"},
+	{"B", "dy2_", "/dy2", "~/dy2.env", "/dy2/run/docker.sock", "/dy2/bin/docker"},
+	{"C", "dy3_", "/dy3", "~/dy3.env", "/dy3/run/docker.sock", "/dy3/bin/docker"},
 }
 
 // ── SSH helpers ───────────────────────────────────────────────────────────────
@@ -361,7 +362,7 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 	{
 		start := time.Now()
 		rs = forAll(client, allInstances, func(c *ssh.Client, inst Instance) (bool, string) {
-			out, se, code := run(c, fmt.Sprintf("sudo DOCKER_HOST=unix://%s docker run --rm alpine echo hello", inst.Socket))
+			out, se, code := run(c, fmt.Sprintf("sudo %s run --rm alpine echo hello", inst.Docker))
 			if code != 0 || !strings.Contains(out, "hello") {
 				return false, se
 			}
@@ -373,8 +374,8 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 			// Save alpine:latest to host cache so DinD tests can load it without
 			// hitting Docker Hub unauthenticated pull rate limits.
 			run(client, fmt.Sprintf(
-				"sudo DOCKER_HOST=unix://%s docker save alpine:latest > /var/tmp/alpine.tar",
-				allInstances[0].Socket,
+				"sudo %s save alpine:latest > /var/tmp/alpine.tar",
+				allInstances[0].Docker,
 			))
 		} else {
 			fail(7, "all instances: container run", failMsgs(rs), d)
@@ -389,7 +390,7 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 	{
 		start := time.Now()
 		rs = forAll(client, allInstances, func(c *ssh.Client, inst Instance) (bool, string) {
-			out, se, code := run(c, fmt.Sprintf("sudo DOCKER_HOST=unix://%s docker run --rm alpine ping -c3 1.1.1.1", inst.Socket))
+			out, se, code := run(c, fmt.Sprintf("sudo %s run --rm alpine ping -c3 1.1.1.1", inst.Docker))
 			if code != 0 || strings.Contains(out, "100% packet loss") {
 				return false, out + se
 			}
@@ -407,7 +408,7 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 	{
 		start := time.Now()
 		rs = forAll(client, allInstances, func(c *ssh.Client, inst Instance) (bool, string) {
-			out, se, code := run(c, fmt.Sprintf("sudo DOCKER_HOST=unix://%s docker run --rm alpine nslookup google.com", inst.Socket))
+			out, se, code := run(c, fmt.Sprintf("sudo %s run --rm alpine nslookup google.com", inst.Docker))
 			if code != 0 || !strings.Contains(out, "Address") {
 				return false, se
 			}
@@ -425,24 +426,34 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 	// ── Phase 6: Docker-in-Docker ─────────────────────────────────────────────
 	//
 
+	// Pre-pull docker:26.1-dind on all instances concurrently.
+	// On a fresh host the image pull can take minutes, which would cause DinD
+	// tests to time out. Pulling upfront keeps the test timeouts about container
+	// startup, not image download.
+	fmt.Println("[INFO] Pre-pulling docker:26.1-dind on all instances...")
+	forAll(client, allInstances, func(c *ssh.Client, inst Instance) (bool, string) {
+		_, _, _ = run(c, fmt.Sprintf("sudo %s pull docker:26.1-dind", inst.Docker))
+		return true, ""
+	})
+
 	// 10 — all instances: start DinD container (no --privileged; sysbox handles it)
 	{
 		start := time.Now()
 		rs = forAll(client, allInstances, func(c *ssh.Client, inst Instance) (bool, string) {
 			cname := "dind-" + strings.ToLower(inst.Label)
-			run(c, fmt.Sprintf("sudo DOCKER_HOST=unix://%s docker rm -f %s 2>/dev/null", inst.Socket, cname))
-			_, se, code := run(c, fmt.Sprintf("sudo DOCKER_HOST=unix://%s docker run -d --name %s docker:26.1-dind", inst.Socket, cname))
+			run(c, fmt.Sprintf("sudo %s rm -f %s 2>/dev/null", inst.Docker, cname))
+			_, se, code := run(c, fmt.Sprintf("sudo %s run -d --name %s docker:26.1-dind", inst.Docker, cname))
 			if code != 0 {
 				return false, se
 			}
 			// Wait up to 120s for inner dockerd
 			for i := 0; i < 60; i++ {
-				_, _, c2 := run(c, fmt.Sprintf("sudo DOCKER_HOST=unix://%s docker exec %s docker info", inst.Socket, cname))
+				_, _, c2 := run(c, fmt.Sprintf("sudo %s exec %s docker info", inst.Docker, cname))
 				if c2 == 0 {
 					// Preload alpine from host cache into inner docker to avoid pull rate limits.
 					run(c, fmt.Sprintf(
-						"sudo DOCKER_HOST=unix://%s docker exec -i %s docker load < /var/tmp/alpine.tar",
-						inst.Socket, cname,
+						"sudo %s exec -i %s docker load < /var/tmp/alpine.tar",
+						inst.Docker, cname,
 					))
 					return true, ""
 				}
@@ -464,8 +475,8 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 		rs = forAll(client, allInstances, func(c *ssh.Client, inst Instance) (bool, string) {
 			cname := "dind-" + strings.ToLower(inst.Label)
 			out, se, code := run(c, fmt.Sprintf(
-				"sudo DOCKER_HOST=unix://%s docker exec %s docker run --rm alpine echo inner-hello",
-				inst.Socket, cname,
+				"sudo %s exec %s docker run --rm alpine echo inner-hello",
+				inst.Docker, cname,
 			))
 			if code != 0 || !strings.Contains(out, "inner-hello") {
 				return false, se
@@ -486,8 +497,8 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 		rs = forAll(client, allInstances, func(c *ssh.Client, inst Instance) (bool, string) {
 			cname := "dind-" + strings.ToLower(inst.Label)
 			out, se, code := run(c, fmt.Sprintf(
-				"sudo DOCKER_HOST=unix://%s docker exec %s docker run --rm alpine ping -c3 1.1.1.1",
-				inst.Socket, cname,
+				"sudo %s exec %s docker run --rm alpine ping -c3 1.1.1.1",
+				inst.Docker, cname,
 			))
 			if code != 0 || strings.Contains(out, "100% packet loss") {
 				return false, out + se
@@ -522,7 +533,7 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 	for _, inst := range allInstances {
 		inst := inst
 		cname := "dind-" + strings.ToLower(inst.Label)
-		run(client, fmt.Sprintf("sudo DOCKER_HOST=unix://%s docker rm -f %s 2>/dev/null", inst.Socket, cname))
+		run(client, fmt.Sprintf("sudo %s rm -f %s 2>/dev/null", inst.Docker, cname))
 	}
 
 	//
@@ -576,7 +587,7 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 					fail(15, "stop/start cycle", "start failed: "+se2, time.Since(start))
 				} else {
 					out, se3, c3 := run(client, fmt.Sprintf(
-						"sudo DOCKER_HOST=unix://%s docker run --rm alpine echo cycled", inst.Socket,
+						"sudo %s run --rm alpine echo cycled", inst.Docker,
 					))
 					if c3 != 0 || !strings.Contains(out, "cycled") {
 						fail(15, "stop/start cycle", "container after restart: "+se3, time.Since(start))
@@ -638,8 +649,8 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 
 		// Try mkdir inside a sysbox container with this bind mount
 		out, se, code := run(client, fmt.Sprintf(
-			"sudo DOCKER_HOST=unix://%s docker run --rm -v %s:/mnt/test alpine sh -c 'mkdir /mnt/test/subdir && echo mkdir-ok'",
-			inst.Socket, testDir,
+			"sudo %s run --rm -v %s:/mnt/test alpine sh -c 'mkdir /mnt/test/subdir && echo mkdir-ok'",
+			inst.Docker, testDir,
 		))
 		nonRootOK := code == 0 && strings.Contains(out, "mkdir-ok")
 
@@ -647,8 +658,8 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 			// Verify the workaround: chown to root, then retry
 			run(client, fmt.Sprintf("sudo chown 0:0 %s", testDir))
 			out, se, code = run(client, fmt.Sprintf(
-				"sudo DOCKER_HOST=unix://%s docker run --rm -v %s:/mnt/test alpine sh -c 'mkdir /mnt/test/subdir2 && echo mkdir-ok'",
-				inst.Socket, testDir,
+				"sudo %s run --rm -v %s:/mnt/test alpine sh -c 'mkdir /mnt/test/subdir2 && echo mkdir-ok'",
+				inst.Docker, testDir,
 			))
 			if code != 0 || !strings.Contains(out, "mkdir-ok") {
 				run(client, fmt.Sprintf("sudo rm -rf %s", testDir))
@@ -672,8 +683,8 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 		start := time.Now()
 		inst := allInstances[0]
 		run(client, fmt.Sprintf(
-			"sudo DOCKER_HOST=unix://%s docker run -d --name load-test alpine sleep 300 2>/dev/null",
-			inst.Socket,
+			"sudo %s run -d --name load-test alpine sleep 300 2>/dev/null",
+			inst.Docker,
 		))
 		_, se, code := run(client, fmt.Sprintf("sudo env DOCKYARD_ENV=%s ~/dockyard.sh destroy --yes", inst.EnvFile))
 		d := time.Since(start)
@@ -732,7 +743,7 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 	{
 		start := time.Now()
 		rs = forAll(client, surviving, func(c *ssh.Client, inst Instance) (bool, string) {
-			out, se, code := run(c, fmt.Sprintf("sudo DOCKER_HOST=unix://%s docker run --rm alpine ping -c3 1.1.1.1", inst.Socket))
+			out, se, code := run(c, fmt.Sprintf("sudo %s run --rm alpine ping -c3 1.1.1.1", inst.Docker))
 			if code != 0 || strings.Contains(out, "100% packet loss") {
 				return false, out + se
 			}
@@ -806,7 +817,7 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 	{
 		start := time.Now()
 		rs = forAll(client, surviving, func(c *ssh.Client, inst Instance) (bool, string) {
-			out, se, code := run(c, fmt.Sprintf("sudo DOCKER_HOST=unix://%s docker run --rm alpine echo hello", inst.Socket))
+			out, se, code := run(c, fmt.Sprintf("sudo %s run --rm alpine echo hello", inst.Docker))
 			if code != 0 || !strings.Contains(out, "hello") {
 				return false, se
 			}
@@ -824,7 +835,7 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 	{
 		start := time.Now()
 		rs = forAll(client, surviving, func(c *ssh.Client, inst Instance) (bool, string) {
-			out, se, code := run(c, fmt.Sprintf("sudo DOCKER_HOST=unix://%s docker run --rm alpine ping -c3 1.1.1.1", inst.Socket))
+			out, se, code := run(c, fmt.Sprintf("sudo %s run --rm alpine ping -c3 1.1.1.1", inst.Docker))
 			if code != 0 || strings.Contains(out, "100% packet loss") {
 				return false, out + se
 			}
@@ -843,22 +854,22 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 		start := time.Now()
 		rs = forAll(client, surviving, func(c *ssh.Client, inst Instance) (bool, string) {
 			cname := "dind-post-" + strings.ToLower(inst.Label)
-			run(c, fmt.Sprintf("sudo DOCKER_HOST=unix://%s docker rm -f %s 2>/dev/null", inst.Socket, cname))
+			run(c, fmt.Sprintf("sudo %s rm -f %s 2>/dev/null", inst.Docker, cname))
 
-			_, se, code := run(c, fmt.Sprintf("sudo DOCKER_HOST=unix://%s docker run -d --name %s docker:26.1-dind", inst.Socket, cname))
+			_, se, code := run(c, fmt.Sprintf("sudo %s run -d --name %s docker:26.1-dind", inst.Docker, cname))
 			if code != 0 {
 				return false, "start: " + se
 			}
 			// Wait for inner dockerd
 			ready := false
 			for i := 0; i < 60; i++ {
-				_, _, c2 := run(c, fmt.Sprintf("sudo DOCKER_HOST=unix://%s docker exec %s docker info", inst.Socket, cname))
+				_, _, c2 := run(c, fmt.Sprintf("sudo %s exec %s docker info", inst.Docker, cname))
 				if c2 == 0 {
 					ready = true
 					// Preload alpine from host cache into inner docker to avoid pull rate limits.
 					run(c, fmt.Sprintf(
-						"sudo DOCKER_HOST=unix://%s docker exec -i %s docker load < /var/tmp/alpine.tar",
-						inst.Socket, cname,
+						"sudo %s exec -i %s docker load < /var/tmp/alpine.tar",
+						inst.Docker, cname,
 					))
 					break
 				}
@@ -869,21 +880,21 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 			}
 			// Inner container
 			out, se, code := run(c, fmt.Sprintf(
-				"sudo DOCKER_HOST=unix://%s docker exec %s docker run --rm alpine echo inner-hello",
-				inst.Socket, cname,
+				"sudo %s exec %s docker run --rm alpine echo inner-hello",
+				inst.Docker, cname,
 			))
 			if code != 0 || !strings.Contains(out, "inner-hello") {
 				return false, "inner container: " + se
 			}
 			// Inner networking
 			out, se, code = run(c, fmt.Sprintf(
-				"sudo DOCKER_HOST=unix://%s docker exec %s docker run --rm alpine ping -c3 1.1.1.1",
-				inst.Socket, cname,
+				"sudo %s exec %s docker run --rm alpine ping -c3 1.1.1.1",
+				inst.Docker, cname,
 			))
 			if code != 0 || strings.Contains(out, "100% packet loss") {
 				return false, "inner networking: " + out + se
 			}
-			run(c, fmt.Sprintf("sudo DOCKER_HOST=unix://%s docker rm -f %s 2>/dev/null", inst.Socket, cname))
+			run(c, fmt.Sprintf("sudo %s rm -f %s 2>/dev/null", inst.Docker, cname))
 			return true, ""
 		})
 		d := time.Since(start)
@@ -974,6 +985,8 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 		nestedPrefix := "dyn_"
 		nestedEnv := "~/dockyard-nested-test/dyn.env"
 		nestedSocket := nestedRoot + "/run/docker.sock"
+		nestedDocker := nestedRoot + "/bin/docker"
+		_ = nestedSocket // used only for reference; docker commands use nestedDocker
 
 		// Pre-cleanup in case a previous run left state
 		run(client, fmt.Sprintf("sudo env DOCKYARD_ENV=%s ~/dockyard.sh destroy --yes 2>/dev/null; true", nestedEnv))
@@ -1004,10 +1017,10 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 
 		if nestedOK {
 			// Preload alpine from host cache to avoid Docker Hub rate limits.
-			run(client, fmt.Sprintf("sudo DOCKER_HOST=unix://%s docker load < /var/tmp/alpine.tar", nestedSocket))
+			run(client, fmt.Sprintf("sudo %s load < /var/tmp/alpine.tar", nestedDocker))
 			out, se, code := run(client, fmt.Sprintf(
-				"sudo DOCKER_HOST=unix://%s docker run --rm alpine echo nested-ok",
-				nestedSocket,
+				"sudo %s run --rm alpine echo nested-ok",
+				nestedDocker,
 			))
 			if code != 0 || !strings.Contains(out, "nested-ok") {
 				nestedOK, nestedMsg = false, "container run: "+se
@@ -1052,10 +1065,10 @@ func checkIsolation(client *ssh.Client, instances []Instance) []string {
 	var containers []cinfo
 	for _, inst := range instances {
 		name := "iso-" + strings.ToLower(inst.Label) + "-check"
-		run(client, fmt.Sprintf("sudo DOCKER_HOST=unix://%s docker rm -f %s 2>/dev/null", inst.Socket, name))
+		run(client, fmt.Sprintf("sudo %s rm -f %s 2>/dev/null", inst.Docker, name))
 		_, _, code := run(client, fmt.Sprintf(
-			"sudo DOCKER_HOST=unix://%s docker run -d --name %s alpine sleep 60",
-			inst.Socket, name,
+			"sudo %s run -d --name %s alpine sleep 60",
+			inst.Docker, name,
 		))
 		if code == 0 {
 			containers = append(containers, cinfo{inst, name})
@@ -1069,8 +1082,8 @@ func checkIsolation(client *ssh.Client, instances []Instance) []string {
 				continue
 			}
 			out, _, _ := run(client, fmt.Sprintf(
-				"sudo DOCKER_HOST=unix://%s docker ps -a --format '{{.Names}}'",
-				viewer.Socket,
+				"sudo %s ps -a --format '{{.Names}}'",
+				viewer.Docker,
 			))
 			if strings.Contains(out, src.name) {
 				fails = append(fails, fmt.Sprintf(
@@ -1083,7 +1096,7 @@ func checkIsolation(client *ssh.Client, instances []Instance) []string {
 
 	// Cleanup
 	for _, c := range containers {
-		run(client, fmt.Sprintf("sudo DOCKER_HOST=unix://%s docker rm -f %s 2>/dev/null", c.inst.Socket, c.name))
+		run(client, fmt.Sprintf("sudo %s rm -f %s 2>/dev/null", c.inst.Docker, c.name))
 	}
 	return fails
 }
