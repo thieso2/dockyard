@@ -252,6 +252,15 @@ DOCKEREOF
 
     echo "Installed binaries to ${BIN_DIR}/"
 
+    # Detect storage driver and backing filesystem.
+    # sysbox requires overlay2 — ZFS native driver causes "unknown fs" errors.
+    # overlay2 works on ZFS 2.2+ with overlayfs kernel support.
+    local STORAGE_DRIVER BACKING_FS
+    STORAGE_DRIVER=$(detect_storage_driver "$DOCKER_DATA")
+    BACKING_FS=$(detect_backing_fs "$DOCKER_DATA")
+    echo "  storage:     ${STORAGE_DRIVER} (on ${BACKING_FS})"
+    echo ""
+
     # Write daemon.json (embedded — no external file dependency)
     # sysbox-runc 0.6.7.9-tc parses --run-dir from os.Args in init(), so
     # runtimeArgs works correctly. No wrapper script needed.
@@ -264,7 +273,7 @@ DOCKEREOF
       "runtimeArgs": ["--run-dir", "${SYSBOX_RUN_DIR}"]
     }
   },
-  "storage-driver": "overlay2",
+  "storage-driver": "${STORAGE_DRIVER}",
   "userland-proxy-path": "${BIN_DIR}/docker-proxy",
   "features": {
     "buildkit": true

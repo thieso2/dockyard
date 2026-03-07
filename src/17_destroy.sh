@@ -97,8 +97,35 @@ cmd_destroy() {
             echo "Removed instance files from ${DOCKYARD_ROOT}/"
             echo "Data preserved at ${DOCKER_DATA}"
         else
-            rm -rf "$DOCKYARD_ROOT"
-            echo "Removed ${DOCKYARD_ROOT}/"
+            # When the data-root sits on a ZFS dataset, Docker (with overlay2)
+            # may have created overlay dirs that need normal removal, and
+            # rm -rf on a ZFS mountpoint removes contents but can't remove
+            # the mountpoint directory itself.
+            local on_zfs=false
+            if command -v zfs &>/dev/null; then
+                local root_dataset
+                root_dataset="$(df --output=source "$DOCKYARD_ROOT" 2>/dev/null | tail -1 | tr -d '[:space:]')" || true
+                if [ -n "$root_dataset" ] && zfs list "$root_dataset" &>/dev/null; then
+                    on_zfs=true
+                    # Destroy all child ZFS datasets (Docker layers, etc.)
+                    local children
+                    children="$(zfs list -r -H -o name "$root_dataset" 2>/dev/null | tail -n +2 | sort -r)" || true
+                    if [ -n "$children" ]; then
+                        echo "Cleaning up ZFS datasets under ${root_dataset}..."
+                        while IFS= read -r ds; do
+                            zfs destroy -f "$ds" 2>/dev/null || true
+                        done <<< "$children"
+                    fi
+                fi
+            fi
+            if [ "$on_zfs" = true ]; then
+                # Can't remove ZFS mountpoint itself; remove contents only
+                rm -rf "${DOCKYARD_ROOT:?}"/* "${DOCKYARD_ROOT}"/.[!.]* 2>/dev/null || true
+                echo "Removed contents of ${DOCKYARD_ROOT}/ (ZFS mountpoint preserved)"
+            else
+                rm -rf "$DOCKYARD_ROOT"
+                echo "Removed ${DOCKYARD_ROOT}/"
+            fi
         fi
     fi
 
