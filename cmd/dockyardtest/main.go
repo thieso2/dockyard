@@ -20,9 +20,9 @@ import (
 
 var (
 	hostFlag    = flag.String("host", "", "Target host IP or hostname (required)")
+	portFlag    = flag.Int("port", 22, "SSH port (default: 22)")
 	userFlag    = flag.String("user", "", "SSH username (required)")
 	keyFlag     = flag.String("key", "", "Path to SSH private key (default: ~/.ssh/id_ed25519)")
-	portFlag    = flag.Int("port", 22, "SSH port (default: 22)")
 	timeoutFlag = flag.Duration("timeout", 20*time.Minute, "Overall test timeout")
 )
 
@@ -47,7 +47,7 @@ var allInstances = []Instance{
 
 // dialSSH tries the SSH agent first (handles passphrase-protected keys
 // transparently), then falls back to plain key files.
-func dialSSH(host, user, keyPath string) (*ssh.Client, error) {
+func dialSSH(host string, port int, user, keyPath string) (*ssh.Client, error) {
 	var authMethods []ssh.AuthMethod
 
 	// SSH agent — already holds the decrypted key, no passphrase needed.
@@ -88,7 +88,7 @@ func dialSSH(host, user, keyPath string) (*ssh.Client, error) {
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec
 		Timeout:         15 * time.Second,
 	}
-	addr := fmt.Sprintf("%s:%d", host, *portFlag)
+	addr := fmt.Sprintf("%s:%d", host, port)
 	client, err := ssh.Dial("tcp", addr, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
@@ -241,7 +241,12 @@ func cleanupAllInstances(client *ssh.Client) {
 			inst.EnvFile, inst.EnvFile,
 		))
 		run(client, fmt.Sprintf("sudo rm -rf /run/%sdocker 2>/dev/null; true", inst.Prefix)) // legacy cleanup
-		run(client, fmt.Sprintf("sudo rm -rf %s 2>/dev/null; true", inst.Root))
+		// Clean ZFS child datasets (Docker ZFS driver creates them) but preserve root dataset
+		run(client, fmt.Sprintf(
+			`if command -v zfs &>/dev/null; then ds=$(df --output=source '%s' 2>/dev/null | tail -1 | tr -d '[:space:]'); if [ -n "$ds" ] && zfs list "$ds" &>/dev/null; then zfs list -r -H -o name "$ds" 2>/dev/null | tail -n +2 | sort -r | while read child; do sudo zfs destroy -f "$child" 2>/dev/null; done; fi; fi; true`,
+			inst.Root,
+		))
+		run(client, fmt.Sprintf("sudo rm -rf %s/* 2>/dev/null; sudo rm -rf %s/.[!.]* 2>/dev/null; true", inst.Root, inst.Root))
 		run(client, fmt.Sprintf("sudo ip link delete %sdocker0 2>/dev/null; true", inst.Prefix))
 		run(client, fmt.Sprintf(
 			"sudo systemctl stop %sdocker 2>/dev/null; sudo systemctl disable %sdocker 2>/dev/null; true",
@@ -259,7 +264,7 @@ func cleanupAllInstances(client *ssh.Client) {
 	run(client, "sudo systemctl daemon-reload 2>/dev/null; true")
 }
 
-func runTests(client *ssh.Client, host, user, keyPath string) {
+func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 	// Pre-flight: ensure no leftover state from a previous run
 	fmt.Println("[INFO] Pre-flight cleanup (removing any leftover state)...")
 	cleanupAllInstances(client)
@@ -445,7 +450,7 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 		rs = forAll(client, allInstances, func(c *ssh.Client, inst Instance) (bool, string) {
 			cname := "dind-" + strings.ToLower(inst.Label)
 			run(c, fmt.Sprintf("sudo %s rm -f %s 2>/dev/null", inst.Docker, cname))
-			_, se, code := run(c, fmt.Sprintf("sudo %s run -d --name %s docker:26.1-dind", inst.Docker, cname))
+			_, se, code := run(c, fmt.Sprintf("sudo %s run -d --name %s -v /dev/null:/usr/sbin/zfs docker:26.1-dind", inst.Docker, cname))
 			if code != 0 {
 				return false, se
 			}
@@ -773,7 +778,7 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 		time.Sleep(15 * time.Second) // wait for it to actually go down
 
 		fmt.Println("[INFO] Waiting for SSH (up to 4min)...")
-		if err := waitForSSH(host, *portFlag, 4*time.Minute); err != nil {
+		if err := waitForSSH(host, port, 4*time.Minute); err != nil {
 			fail(22, "reboot", err.Error(), time.Since(start))
 			return
 		}
@@ -781,7 +786,7 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 		time.Sleep(10 * time.Second)
 
 		var reconnErr error
-		client, reconnErr = dialSSH(host, user, keyPath)
+		client, reconnErr = dialSSH(host, port, user, keyPath)
 		if reconnErr != nil {
 			fail(22, "reboot", "could not reconnect: "+reconnErr.Error(), time.Since(start))
 			return
@@ -859,7 +864,7 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 			cname := "dind-post-" + strings.ToLower(inst.Label)
 			run(c, fmt.Sprintf("sudo %s rm -f %s 2>/dev/null", inst.Docker, cname))
 
-			_, se, code := run(c, fmt.Sprintf("sudo %s run -d --name %s docker:26.1-dind", inst.Docker, cname))
+			_, se, code := run(c, fmt.Sprintf("sudo %s run -d --name %s -v /dev/null:/usr/sbin/zfs docker:26.1-dind", inst.Docker, cname))
 			if code != 0 {
 				return false, "start: " + se
 			}
@@ -945,10 +950,15 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 			if strings.Contains(ipt, inst.Prefix) {
 				cleanFails = append(cleanFails, inst.Label+": residual iptables rules")
 			}
-			// data directory (instance root)
+			// data directory (instance root) — on ZFS the mountpoint directory persists
+			// but must be empty; on other filesystems it must be gone entirely
 			out, _, _ := run(client, fmt.Sprintf("[ -d %s ] && echo exists || echo gone", inst.Root))
 			if strings.TrimSpace(out) == "exists" {
-				cleanFails = append(cleanFails, inst.Label+": "+inst.Root+" still exists")
+				// Check if it's an empty ZFS mountpoint (acceptable) vs leftover data (failure)
+				countOut, _, _ := run(client, fmt.Sprintf("ls -A %s 2>/dev/null | wc -l", inst.Root))
+				if strings.TrimSpace(countOut) != "0" {
+					cleanFails = append(cleanFails, inst.Label+": "+inst.Root+" still has contents after destroy")
+				}
 			}
 			// per-instance sysbox run dir gone (run/sysbox inside instance root)
 			out, _, _ = run(client, fmt.Sprintf("[ -d %s/run/sysbox ] && echo exists || echo gone", inst.Root))
@@ -1592,12 +1602,12 @@ func runTests(client *ssh.Client, host, user, keyPath string) {
 			time.Sleep(15 * time.Second)
 
 			fmt.Println("[INFO] Waiting for SSH (up to 4min)...")
-			if err := waitForSSH(host, *portFlag, 4*time.Minute); err != nil {
+			if err := waitForSSH(host, port, 4*time.Minute); err != nil {
 				msgs = append(msgs, "reboot: "+err.Error())
 			} else {
 				time.Sleep(10 * time.Second)
 				var reconnErr error
-				client, reconnErr = dialSSH(host, user, keyPath)
+				client, reconnErr = dialSSH(host, port, user, keyPath)
 				if reconnErr != nil {
 					msgs = append(msgs, "reconnect: "+reconnErr.Error())
 				}
@@ -1719,7 +1729,7 @@ func main() {
 	}
 
 	fmt.Printf("Connecting to %s@%s:%d...\n", *userFlag, *hostFlag, *portFlag)
-	client, err := dialSSH(*hostFlag, *userFlag, kp)
+	client, err := dialSSH(*hostFlag, *portFlag, *userFlag, kp)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "SSH connect failed: %v\n", err)
 		os.Exit(1)
@@ -1731,7 +1741,7 @@ func main() {
 	defer cancel()
 
 	suiteStart := time.Now()
-	runTests(client, *hostFlag, *userFlag, kp)
+	runTests(client, *hostFlag, *portFlag, *userFlag, kp)
 	totalElapsed := time.Since(suiteStart)
 
 	total := 38 // total expected tests

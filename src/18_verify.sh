@@ -55,7 +55,9 @@ cmd_verify() {
     # 6. Docker-in-Docker via sysbox
     local cname="dockyard-verify-$$"
     DOCKER_HOST="$_s" "$_d" rm -f "$cname" >/dev/null 2>&1 || true
-    if DOCKER_HOST="$_s" "$_d" run -d --name "$cname" docker:26.1-dind >/dev/null 2>&1; then
+    # Mask /usr/sbin/zfs inside DinD to prevent the containerd ZFS snapshotter
+    # probe from hanging for 10s when the outer filesystem is ZFS.
+    if DOCKER_HOST="$_s" "$_d" run -d --name "$cname" -v /dev/null:/usr/sbin/zfs docker:26.1-dind >/dev/null 2>&1; then
         local ready=false i
         for i in $(seq 1 30); do
             if DOCKER_HOST="$_s" "$_d" exec "$cname" docker info >/dev/null 2>&1; then
@@ -80,7 +82,7 @@ cmd_verify() {
         fi
         DOCKER_HOST="$_s" "$_d" rm -f "$cname" >/dev/null 2>&1 || true
     else
-        out=$(DOCKER_HOST="$_s" "$_d" run --name "$cname" docker:26.1-dind 2>&1 | head -3)
+        out=$(DOCKER_HOST="$_s" "$_d" run --name "$cname" -v /dev/null:/usr/sbin/zfs docker:26.1-dind 2>&1 | head -3)
         DOCKER_HOST="$_s" "$_d" rm -f "$cname" >/dev/null 2>&1 || true
         _fail "DinD" "could not start docker:26.1-dind — $out"
     fi

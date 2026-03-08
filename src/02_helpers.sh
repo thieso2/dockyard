@@ -73,6 +73,48 @@ cleanup_pool_bridges() {
     [ "$removed" -gt 0 ] || true
 }
 
+# Detect the backing filesystem type for the given data directory.
+# Returns the fstype string (e.g., "ext4", "zfs", "xfs").
+detect_backing_fs() {
+    local data_dir="$1"
+
+    # Walk up to the nearest existing directory
+    local check_dir="$data_dir"
+    while [ ! -d "$check_dir" ]; do
+        check_dir="$(dirname "$check_dir")"
+    done
+
+    df --output=fstype "$check_dir" 2>/dev/null | tail -1 | tr -d '[:space:]'
+}
+
+# Detect the optimal Docker storage driver for the given data directory.
+# Always returns "overlay2" — sysbox-runc does not support ZFS as a container
+# rootfs filesystem (fails with "unknown fs"). overlay2 works on ZFS 2.2+ and
+# on all other common Linux filesystems.
+# Can be overridden with DOCKYARD_STORAGE_DRIVER for future use.
+detect_storage_driver() {
+    local data_dir="$1"
+
+    # Manual override
+    if [ -n "${DOCKYARD_STORAGE_DRIVER:-}" ]; then
+        case "$DOCKYARD_STORAGE_DRIVER" in
+            auto)   ;; # fall through to detection
+            overlay2|zfs)
+                echo "$DOCKYARD_STORAGE_DRIVER"
+                return
+                ;;
+            *)
+                echo "Error: unsupported DOCKYARD_STORAGE_DRIVER=${DOCKYARD_STORAGE_DRIVER} (use auto, overlay2, or zfs)" >&2
+                exit 1
+                ;;
+        esac
+    fi
+
+    # sysbox requires overlay2 — it does not recognize ZFS rootfs.
+    # overlay2 works on ZFS 2.2+ with overlayfs kernel support.
+    echo "overlay2"
+}
+
 wait_for_file() {
     local file="$1"
     local label="$2"

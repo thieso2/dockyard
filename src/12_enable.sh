@@ -118,6 +118,7 @@ Description=Dockyard Docker (${SERVICE_NAME})
 After=network-online.target nss-lookup.target firewalld.service time-set.target
 Before=docker.service
 Wants=network-online.target
+RequiresMountsFor=${DOCKYARD_ROOT}
 StartLimitBurst=3
 StartLimitIntervalSec=60
 
