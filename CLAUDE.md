@@ -12,6 +12,7 @@ Dockyard: multi-instance Docker daemon installer with sysbox-runc as default run
 # Build dist/dockyard.sh from src/*.sh (concatenates in numeric order, strips per-file shebangs)
 ./build.sh
 
+# Go is managed by mise (.mise.toml); run `mise install` once, then:
 # Build the integration test binary (run from repo root)
 GOOS=linux GOARCH=amd64 go build -o cmd/dockyardtest/dockyardtest_linux ./cmd/dockyardtest/
 GOOS=linux GOARCH=arm64 go build -o cmd/dockyardtest/dockyardtest_linux_arm64 ./cmd/dockyardtest/
@@ -25,14 +26,28 @@ The `dockyard.sh` at the repo root is the working copy (not a symlink). `dist/do
 The test suite (`cmd/dockyardtest/main.go`) SSHes into a remote Linux VM and runs 29 end-to-end tests across 3 dockyard instances.
 
 ```bash
-# Upload dist + binary to target host, then run
-./dockyardtest_mac --host HOST --user thies [--key /path/to/key]
+# Run against a test VM (uploads dist/dockyard.sh automatically)
+./dockyardtest_mac --host HOST --user thies [--key /path/to/key] [--port PORT]
+
+# Sandcastle iso-test VM (via Tailscale)
+./cmd/dockyardtest/dockyardtest_mac --host 100.106.185.92 --user thies --port 2223
 
 # Run a specific test by name (substring match on test subject)
 ./dockyardtest_mac --host HOST --user thies --run "verify"
 ```
 
-See MEMORY.md for known test VM addresses and cross-host SSH key setup.
+### Test VM Setup (Sandcastle)
+
+The `iso-test` VM on sandcastle (100.106.185.92) runs the full 38-test suite:
+- Incus VM: `incus launch images:ubuntu/noble iso-test --vm -c limits.cpu=4 -c limits.memory=8GiB -d root,size=50GiB`
+- Static IP: 10.50.0.20/24 via netplan on enp5s0, gateway 10.50.0.1
+- SSH: port-forwarded from host :2223 → VM :22
+- DNS: systemd-resolved with 1.1.1.1/8.8.8.8
+- Host iptables: FORWARD rules for incusbr0 + NAT MASQUERADE for 10.50.0.0/24
+- Prereqs: `openssh-server iptables rsync fuse3 iproute2 jq curl`
+- Alpine cache: `/var/tmp/alpine.tar` (bootstrapped via a temporary dockyard instance)
+
+See MEMORY.md for full infrastructure details.
 
 ## Key Commands
 

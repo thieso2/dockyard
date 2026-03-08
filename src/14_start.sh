@@ -64,8 +64,10 @@ cmd_start() {
         echo "Bridge ${BRIDGE} already exists"
     fi
 
-    # Enable IP forwarding
+    # Enable IP forwarding and bridge netfilter (needed for isolation.d iptables on bridge traffic)
     sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    modprobe br_netfilter 2>/dev/null || true
+    sysctl -w net.bridge.bridge-nf-call-iptables=1 >/dev/null 2>&1 || true
 
     # Bridge rules (idempotent)
     iptables -C FORWARD -i "$BRIDGE" -o "$BRIDGE" -j ACCEPT 2>/dev/null ||
