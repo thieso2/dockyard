@@ -88,9 +88,10 @@ func dialSSH(host string, port int, user, keyPath string) (*ssh.Client, error) {
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(), //nolint:gosec
 		Timeout:         15 * time.Second,
 	}
-	client, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", host, port), cfg)
+	addr := fmt.Sprintf("%s:%d", host, port)
+	client, err := ssh.Dial("tcp", addr, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", host, err)
+		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
 	return client, nil
 }
@@ -1063,6 +1064,605 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 			fail(30, "nested DOCKYARD_ROOT lifecycle", nestedMsg, d)
 		}
 	}
+
+	//
+	// ── Phase 14: isolation.d iptables mechanism ─────────────────────────────
+	//
+	// Tests T1-T10 from multi_tenant.md. Uses a fresh instance A (was
+	// destroyed in phase 10). We re-create it here so the isolation tests
+	// are self-contained.
+
+	instA := allInstances[0]
+	isoChainA := "DOCKYARD-ISO-" + strings.TrimSuffix(instA.Prefix, "_")
+	isoOK := true // gates subsequent isolation tests
+
+	fmt.Println("[INFO] Re-creating instance A for isolation.d tests...")
+	{
+		_, se, c := run(client, fmt.Sprintf(
+			"rm -f %s && DOCKYARD_ENV=%s DOCKYARD_ROOT=%s DOCKYARD_DOCKER_PREFIX=%s ~/dockyard.sh gen-env",
+			instA.EnvFile, instA.EnvFile, instA.Root, instA.Prefix,
+		))
+		if c != 0 {
+			fail(31, "isolation.d: re-create instance A (gen-env)", se, 0)
+			isoOK = false
+			goto done
+		}
+		_, se, c = run(client, fmt.Sprintf("sudo env DOCKYARD_ENV=%s ~/dockyard.sh create", instA.EnvFile))
+		if c != 0 {
+			fail(31, "isolation.d: re-create instance A (create)", se, 0)
+			isoOK = false
+			goto done
+		}
+		// Preload alpine from host cache
+		run(client, fmt.Sprintf("sudo %s load < /var/tmp/alpine.tar 2>/dev/null; true", instA.Docker))
+	}
+
+	// 31 — T1+T2: chain created when rules exist, absent otherwise
+	if isoOK {
+		start := time.Now()
+		instB := allInstances[1]
+		isoChainB := "DOCKYARD-ISO-" + strings.TrimSuffix(instB.Prefix, "_")
+
+		var msgs []string
+
+		// Write a dummy rules file to A's isolation.d
+		_, se, c := run(client, fmt.Sprintf(
+			"sudo mkdir -p %s/etc/isolation.d && echo '10.99.99.1' | sudo tee %s/etc/isolation.d/test.rules >/dev/null",
+			instA.Root, instA.Root,
+		))
+		if c != 0 {
+			msgs = append(msgs, "write rules: "+se)
+		}
+
+		// Create a user-defined network so ExecStartPost has a br-* bridge to attach to
+		if len(msgs) == 0 {
+			run(client, fmt.Sprintf("sudo %s network create iso-trigger-net 2>/dev/null; true", instA.Docker))
+		}
+
+		// Restart A's service to pick up the rules
+		if len(msgs) == 0 {
+			run(client, fmt.Sprintf("sudo systemctl reset-failed %sdocker 2>/dev/null; true", instA.Prefix))
+			_, se, c = run(client, fmt.Sprintf("sudo systemctl restart %sdocker", instA.Prefix))
+			if c != 0 {
+				msgs = append(msgs, "restart A: "+se)
+			}
+			time.Sleep(5 * time.Second)
+		}
+
+		// T1a: Chain exists
+		if len(msgs) == 0 {
+			out, _, c := run(client, fmt.Sprintf("sudo iptables -L %s -n 2>&1", isoChainA))
+			if c != 0 {
+				msgs = append(msgs, "chain not created: "+out)
+			}
+		}
+
+		// T1b: Chain contains ACCEPT for the IP
+		if len(msgs) == 0 {
+			out, _, _ := run(client, fmt.Sprintf("sudo iptables -L %s -n", isoChainA))
+			if !strings.Contains(out, "10.99.99.1") {
+				msgs = append(msgs, "chain missing ACCEPT for 10.99.99.1")
+			}
+		}
+
+		// T1c: Chain ends with DROP
+		if len(msgs) == 0 {
+			out, _, _ := run(client, fmt.Sprintf("sudo iptables -L %s -n", isoChainA))
+			lines := strings.Split(strings.TrimSpace(out), "\n")
+			lastLine := lines[len(lines)-1]
+			if !strings.Contains(lastLine, "DROP") {
+				msgs = append(msgs, "chain does not end with DROP (last line: "+lastLine+")")
+			}
+		}
+
+		// T1d: FORWARD jump rule exists scoped to a br-* bridge
+		if len(msgs) == 0 {
+			out, _, _ := run(client, fmt.Sprintf("sudo iptables -L FORWARD -n -v | grep %s || true", isoChainA))
+			if !strings.Contains(out, "br-") {
+				msgs = append(msgs, "no bridge-scoped FORWARD jump rule")
+			}
+		}
+
+		// T2: Instance B has no rules files → no isolation chain
+		if len(msgs) == 0 {
+			_, _, c = run(client, fmt.Sprintf("sudo iptables -L %s -n 2>/dev/null", isoChainB))
+			if c == 0 {
+				msgs = append(msgs, "B has isolation chain but no rules files")
+			}
+		}
+
+		d := time.Since(start)
+		if len(msgs) == 0 {
+			pass(31, "isolation.d: chain created with rules, absent without (T1+T2)", d)
+		} else {
+			fail(31, "isolation.d: chain creation", strings.Join(msgs, " | "), d)
+			isoOK = false
+		}
+	}
+
+	// 32 — T3+T4: allowed IPs pass, non-allowed IPs blocked
+	//
+	// Strategy: create a user-defined network with a known subnet (--subnet),
+	// assign static IPs to containers, write the infra IP to rules BEFORE
+	// creating the network, so only one restart is needed.
+	if isoOK {
+		start := time.Now()
+		docker := instA.Docker
+		var msgs []string
+
+		// Use a fixed subnet so container IPs are predictable
+		isoSubnet := "10.88.77.0/24"
+		infraIP := "10.88.77.10"
+		tenantAIP := "10.88.77.20"
+		tenantBIP := "10.88.77.30"
+
+		// Write infra IP to rules and restart FIRST (before creating containers)
+		run(client, fmt.Sprintf(
+			"echo '%s' | sudo tee %s/etc/isolation.d/test.rules >/dev/null",
+			infraIP, instA.Root,
+		))
+		run(client, fmt.Sprintf("sudo systemctl reset-failed %sdocker 2>/dev/null; true", instA.Prefix))
+		_, se, c := run(client, fmt.Sprintf("sudo systemctl restart %sdocker", instA.Prefix))
+		if c != 0 {
+			msgs = append(msgs, "restart: "+se)
+		} else {
+			time.Sleep(5 * time.Second)
+		}
+
+		// Create network with fixed subnet
+		if len(msgs) == 0 {
+			run(client, fmt.Sprintf("sudo %s network rm iso-test-net 2>/dev/null; true", docker))
+			_, se, c = run(client, fmt.Sprintf(
+				"sudo %s network create --subnet %s iso-test-net",
+				docker, isoSubnet,
+			))
+			if c != 0 {
+				msgs = append(msgs, "create network: "+se)
+			}
+		}
+
+		// Start 3 containers with static IPs
+		if len(msgs) == 0 {
+			for _, ct := range []struct{ name, ip string }{
+				{"infra", infraIP}, {"tenant-a", tenantAIP}, {"tenant-b", tenantBIP},
+			} {
+				run(client, fmt.Sprintf("sudo %s rm -f %s 2>/dev/null", docker, ct.name))
+				_, se, c = run(client, fmt.Sprintf(
+					"sudo %s run -d --name %s --network iso-test-net --ip %s alpine sleep 300",
+					docker, ct.name, ct.ip,
+				))
+				if c != 0 {
+					msgs = append(msgs, "start "+ct.name+": "+se)
+				}
+			}
+		}
+
+		// The new network created a br-* bridge. We need to add the jump rule
+		// for it. Restart the service to pick up the new bridge.
+		if len(msgs) == 0 {
+			run(client, fmt.Sprintf("sudo systemctl reset-failed %sdocker 2>/dev/null; true", instA.Prefix))
+			_, se, c = run(client, fmt.Sprintf("sudo systemctl restart %sdocker", instA.Prefix))
+			if c != 0 {
+				msgs = append(msgs, "restart for bridge jump: "+se)
+			} else {
+				time.Sleep(5 * time.Second)
+			}
+			// Recreate containers (restart killed them), same static IPs
+			for _, ct := range []struct{ name, ip string }{
+				{"infra", infraIP}, {"tenant-a", tenantAIP}, {"tenant-b", tenantBIP},
+			} {
+				run(client, fmt.Sprintf("sudo %s rm -f %s 2>/dev/null", docker, ct.name))
+				run(client, fmt.Sprintf(
+					"sudo %s run -d --name %s --network iso-test-net --ip %s alpine sleep 300",
+					docker, ct.name, ct.ip,
+				))
+			}
+		}
+
+		// T3: tenant-a can reach infra (infra IP is in the allow-list)
+		if len(msgs) == 0 {
+			out, _, c := run(client, fmt.Sprintf(
+				"sudo %s exec tenant-a ping -c2 -W3 %s", docker, infraIP,
+			))
+			if c != 0 || strings.Contains(out, "100% packet loss") {
+				msgs = append(msgs, "tenant-a cannot reach infra ("+infraIP+")")
+			}
+		}
+
+		// T4: tenant-a CANNOT reach tenant-b (neither is in allow-list → DROP)
+		if len(msgs) == 0 {
+			_, _, c = run(client, fmt.Sprintf(
+				"sudo %s exec tenant-a ping -c2 -W3 %s", docker, tenantBIP,
+			))
+			if c == 0 {
+				msgs = append(msgs, "tenant-a CAN reach tenant-b ("+tenantBIP+") — should be blocked")
+			}
+		}
+
+		// Leave containers and network for subsequent tests
+		d := time.Since(start)
+		if len(msgs) == 0 {
+			pass(32, "isolation.d: allowed IPs pass, non-allowed blocked (T3+T4)", d)
+		} else {
+			fail(32, "isolation.d: traffic filtering", strings.Join(msgs, " | "), d)
+			isoOK = false
+		}
+	}
+
+	// 33 — T5: isolation chain cleaned up on stop, recreated on start
+	if isoOK {
+		start := time.Now()
+		var msgs []string
+
+		// Stop instance A
+		_, se, c := run(client, fmt.Sprintf("sudo systemctl stop %sdocker", instA.Prefix))
+		if c != 0 {
+			msgs = append(msgs, "stop: "+se)
+		}
+
+		// Chain should be gone
+		if len(msgs) == 0 {
+			_, _, c = run(client, fmt.Sprintf("sudo iptables -L %s -n 2>/dev/null", isoChainA))
+			if c == 0 {
+				msgs = append(msgs, "chain still exists after stop")
+			}
+		}
+
+		// No FORWARD rules should reference the chain
+		if len(msgs) == 0 {
+			out, _, _ := run(client, fmt.Sprintf("sudo iptables -L FORWARD -n | grep %s || true", isoChainA))
+			if strings.Contains(out, isoChainA) {
+				msgs = append(msgs, "FORWARD still references chain after stop")
+			}
+		}
+
+		// Start instance A again
+		if len(msgs) == 0 {
+			run(client, fmt.Sprintf("sudo systemctl reset-failed %sdocker 2>/dev/null; true", instA.Prefix))
+			_, se, c = run(client, fmt.Sprintf("sudo systemctl start %sdocker", instA.Prefix))
+			if c != 0 {
+				msgs = append(msgs, "start: "+se)
+			} else {
+				time.Sleep(5 * time.Second)
+			}
+		}
+
+		// Chain should be recreated (rules file still present)
+		if len(msgs) == 0 {
+			_, _, c = run(client, fmt.Sprintf("sudo iptables -L %s -n 2>/dev/null", isoChainA))
+			if c != 0 {
+				msgs = append(msgs, "chain not recreated after start")
+			}
+		}
+
+		d := time.Since(start)
+		if len(msgs) == 0 {
+			pass(33, "isolation.d: chain cleaned up on stop, recreated on start (T5)", d)
+		} else {
+			fail(33, "isolation.d: stop/start chain lifecycle", strings.Join(msgs, " | "), d)
+			isoOK = false
+		}
+	}
+
+	// 34 — T6: multiple rules files merged
+	if isoOK {
+		start := time.Now()
+		var msgs []string
+
+		ip1 := "10.88.77.10"
+		ip2 := "10.88.77.20"
+
+		// Write two separate rules files
+		run(client, fmt.Sprintf(
+			"echo '%s' | sudo tee %s/etc/isolation.d/infra.rules >/dev/null",
+			ip1, instA.Root,
+		))
+		run(client, fmt.Sprintf(
+			"echo '%s' | sudo tee %s/etc/isolation.d/extra.rules >/dev/null",
+			ip2, instA.Root,
+		))
+		// Remove old test.rules to keep things clean
+		run(client, fmt.Sprintf("sudo rm -f %s/etc/isolation.d/test.rules", instA.Root))
+
+		// Restart to apply
+		run(client, fmt.Sprintf("sudo systemctl reset-failed %sdocker 2>/dev/null; true", instA.Prefix))
+		_, se, c := run(client, fmt.Sprintf("sudo systemctl restart %sdocker", instA.Prefix))
+		if c != 0 {
+			msgs = append(msgs, "restart: "+se)
+		} else {
+			time.Sleep(5 * time.Second)
+		}
+
+		// Verify chain contains ACCEPT for both IPs
+		if len(msgs) == 0 {
+			out, _, _ := run(client, fmt.Sprintf("sudo iptables -L %s -n", isoChainA))
+			if !strings.Contains(out, ip1) {
+				msgs = append(msgs, "chain missing ACCEPT for "+ip1)
+			}
+			if !strings.Contains(out, ip2) {
+				msgs = append(msgs, "chain missing ACCEPT for "+ip2)
+			}
+		}
+
+		d := time.Since(start)
+		if len(msgs) == 0 {
+			pass(34, "isolation.d: multiple rules files merged (T6)", d)
+		} else {
+			fail(34, "isolation.d: multiple rules files", strings.Join(msgs, " | "), d)
+		}
+	}
+
+	// 35 — T7: comments and blank lines in rules files ignored
+	if isoOK {
+		start := time.Now()
+		var msgs []string
+
+		// Write a rules file with comments, blank lines, indented comments
+		rulesContent := `# This is a comment
+10.0.0.1
+
+  # Indented comment
+10.0.0.2
+`
+		run(client, fmt.Sprintf(
+			"echo '%s' | sudo tee %s/etc/isolation.d/test-comments.rules >/dev/null",
+			rulesContent, instA.Root,
+		))
+		// Remove other rules files so only this one is active
+		run(client, fmt.Sprintf("sudo rm -f %s/etc/isolation.d/infra.rules %s/etc/isolation.d/extra.rules",
+			instA.Root, instA.Root))
+
+		// Restart to apply
+		run(client, fmt.Sprintf("sudo systemctl reset-failed %sdocker 2>/dev/null; true", instA.Prefix))
+		_, se, c := run(client, fmt.Sprintf("sudo systemctl restart %sdocker", instA.Prefix))
+		if c != 0 {
+			msgs = append(msgs, "restart: "+se)
+		} else {
+			time.Sleep(5 * time.Second)
+		}
+
+		if len(msgs) == 0 {
+			out, _, _ := run(client, fmt.Sprintf("sudo iptables -L %s -n", isoChainA))
+			// Should have ACCEPT for 10.0.0.1 and 10.0.0.2
+			if !strings.Contains(out, "10.0.0.1") {
+				msgs = append(msgs, "missing ACCEPT for 10.0.0.1")
+			}
+			if !strings.Contains(out, "10.0.0.2") {
+				msgs = append(msgs, "missing ACCEPT for 10.0.0.2")
+			}
+			// Should NOT contain # artifacts
+			if strings.Contains(out, "#") {
+				msgs = append(msgs, "comment artifacts in chain rules")
+			}
+			// Count ACCEPT rules: should be exactly 4 (src+dst for each IP)
+			// plus ESTABLISHED,RELATED. Lines with ACCEPT:
+			acceptCount := 0
+			for _, line := range strings.Split(out, "\n") {
+				if strings.Contains(line, "ACCEPT") {
+					acceptCount++
+				}
+			}
+			// Expected: 1 (ESTABLISHED,RELATED) + 2 (src 10.0.0.1) + 2 (dst 10.0.0.1) wait no...
+			// Actually: ESTABLISHED,RELATED + src 10.0.0.1 + dst 10.0.0.1 + src 10.0.0.2 + dst 10.0.0.2 = 5
+			if acceptCount != 5 {
+				msgs = append(msgs, fmt.Sprintf("expected 5 ACCEPT rules, got %d", acceptCount))
+			}
+		}
+
+		d := time.Since(start)
+		if len(msgs) == 0 {
+			pass(35, "isolation.d: comments and blank lines ignored (T7)", d)
+		} else {
+			fail(35, "isolation.d: comment parsing", strings.Join(msgs, " | "), d)
+		}
+	}
+
+	// 36 — T8: cross-instance isolation preserved with isolation.d
+	//
+	// With isolation.d enabled on A, verify A's containers are not visible
+	// via the system docker (if installed) or any other Docker socket.
+	if isoOK {
+		start := time.Now()
+		var msgs []string
+
+		// Start a uniquely-named container in A
+		run(client, fmt.Sprintf("sudo %s rm -f iso-cross-a 2>/dev/null", instA.Docker))
+		_, se, c := run(client, fmt.Sprintf(
+			"sudo %s run -d --name iso-cross-a alpine sleep 60", instA.Docker,
+		))
+		if c != 0 {
+			msgs = append(msgs, "start container on A: "+se)
+		}
+
+		// Verify A's container is NOT visible via system docker (if installed)
+		if len(msgs) == 0 {
+			_, _, sysCode := run(client, "which docker")
+			if sysCode == 0 {
+				out, _, _ := run(client, "sudo docker ps -a --format '{{.Names}}' 2>/dev/null")
+				if strings.Contains(out, "iso-cross-a") {
+					msgs = append(msgs, "container iso-cross-a visible in system docker ps")
+				}
+			}
+		}
+
+		// Verify A's socket is not the default docker socket
+		if len(msgs) == 0 {
+			out, _, _ := run(client, fmt.Sprintf("ls -la %s/run/docker.sock", instA.Root))
+			if strings.Contains(out, "/var/run/docker.sock") {
+				msgs = append(msgs, "A's socket is the default docker socket")
+			}
+		}
+
+		// Verify A can see its own container
+		if len(msgs) == 0 {
+			out, _, _ := run(client, fmt.Sprintf(
+				"sudo %s ps -a --format '{{.Names}}'", instA.Docker,
+			))
+			if !strings.Contains(out, "iso-cross-a") {
+				msgs = append(msgs, "container iso-cross-a not visible in A's own docker ps")
+			}
+		}
+
+		run(client, fmt.Sprintf("sudo %s rm -f iso-cross-a 2>/dev/null", instA.Docker))
+
+		d := time.Since(start)
+		if len(msgs) == 0 {
+			pass(36, "isolation.d: daemon isolation preserved (T8)", d)
+		} else {
+			fail(36, "isolation.d: cross-instance isolation", strings.Join(msgs, " | "), d)
+		}
+	}
+
+	// 37 — T9: destroy cleans up isolation chain and rules directory
+	if isoOK {
+		start := time.Now()
+		var msgs []string
+
+		// Destroy instance A
+		_, se, c := run(client, fmt.Sprintf(
+			"sudo env DOCKYARD_ENV=%s ~/dockyard.sh destroy --yes", instA.EnvFile,
+		))
+		if c != 0 {
+			msgs = append(msgs, "destroy: "+se)
+		}
+
+		// Chain should be gone
+		if len(msgs) == 0 {
+			_, _, c = run(client, fmt.Sprintf("sudo iptables -L %s -n 2>/dev/null", isoChainA))
+			if c == 0 {
+				msgs = append(msgs, "chain still exists after destroy")
+			}
+		}
+
+		// isolation.d directory should be gone (part of DOCKYARD_ROOT)
+		if len(msgs) == 0 {
+			out, _, _ := run(client, fmt.Sprintf(
+				"[ -d %s/etc/isolation.d ] && echo exists || echo gone", instA.Root,
+			))
+			if strings.TrimSpace(out) == "exists" {
+				msgs = append(msgs, "isolation.d directory still exists after destroy")
+			}
+		}
+
+		d := time.Since(start)
+		if len(msgs) == 0 {
+			pass(37, "isolation.d: destroy cleans up chain and rules dir (T9)", d)
+		} else {
+			fail(37, "isolation.d: destroy cleanup", strings.Join(msgs, " | "), d)
+		}
+	}
+
+	// 38 — T10: isolation survives reboot
+	//
+	// Re-create instance A with isolation rules, reboot the host, verify
+	// the chain is automatically recreated by the systemd service.
+	if isoOK {
+		start := time.Now()
+		var msgs []string
+
+		// Re-create instance A
+		run(client, fmt.Sprintf(
+			"rm -f %s && DOCKYARD_ENV=%s DOCKYARD_ROOT=%s DOCKYARD_DOCKER_PREFIX=%s ~/dockyard.sh gen-env",
+			instA.EnvFile, instA.EnvFile, instA.Root, instA.Prefix,
+		))
+		_, se, c := run(client, fmt.Sprintf("sudo env DOCKYARD_ENV=%s ~/dockyard.sh create", instA.EnvFile))
+		if c != 0 {
+			msgs = append(msgs, "create: "+se)
+		}
+
+		// Write rules and create a user-defined network for a br-* bridge
+		if len(msgs) == 0 {
+			run(client, fmt.Sprintf(
+				"sudo mkdir -p %s/etc/isolation.d && echo '10.99.99.1' | sudo tee %s/etc/isolation.d/reboot-test.rules >/dev/null",
+				instA.Root, instA.Root,
+			))
+			run(client, fmt.Sprintf("sudo %s network create iso-reboot-net 2>/dev/null; true", instA.Docker))
+			run(client, fmt.Sprintf("sudo systemctl reset-failed %sdocker 2>/dev/null; true", instA.Prefix))
+			_, se, c = run(client, fmt.Sprintf("sudo systemctl restart %sdocker", instA.Prefix))
+			if c != 0 {
+				msgs = append(msgs, "restart: "+se)
+			} else {
+				time.Sleep(5 * time.Second)
+			}
+		}
+
+		// Verify chain exists before reboot
+		if len(msgs) == 0 {
+			_, _, c = run(client, fmt.Sprintf("sudo iptables -L %s -n 2>/dev/null", isoChainA))
+			if c != 0 {
+				msgs = append(msgs, "chain not created before reboot")
+			}
+		}
+
+		// Reboot
+		if len(msgs) == 0 {
+			fmt.Println("[INFO] Rebooting host for isolation reboot test...")
+			run(client, "sudo reboot")
+			client.Close()
+			time.Sleep(15 * time.Second)
+
+			fmt.Println("[INFO] Waiting for SSH (up to 4min)...")
+			if err := waitForSSH(host, port, 4*time.Minute); err != nil {
+				msgs = append(msgs, "reboot: "+err.Error())
+			} else {
+				time.Sleep(10 * time.Second)
+				var reconnErr error
+				client, reconnErr = dialSSH(host, port, user, keyPath)
+				if reconnErr != nil {
+					msgs = append(msgs, "reconnect: "+reconnErr.Error())
+				}
+			}
+		}
+
+		// Wait for A's service to be active (up to 90s)
+		if len(msgs) == 0 {
+			deadline := time.Now().Add(90 * time.Second)
+			active := false
+			for time.Now().Before(deadline) {
+				_, _, c = run(client, "systemctl is-active "+instA.Prefix+"docker")
+				if c == 0 {
+					active = true
+					break
+				}
+				time.Sleep(2 * time.Second)
+			}
+			if !active {
+				msgs = append(msgs, "service not active after reboot")
+			}
+		}
+
+		// Verify chain is recreated
+		if len(msgs) == 0 {
+			_, _, c = run(client, fmt.Sprintf("sudo iptables -L %s -n 2>/dev/null", isoChainA))
+			if c != 0 {
+				msgs = append(msgs, "chain not recreated after reboot")
+			}
+		}
+
+		// Verify rules content matches
+		if len(msgs) == 0 {
+			out, _, _ := run(client, fmt.Sprintf("sudo iptables -L %s -n", isoChainA))
+			if !strings.Contains(out, "10.99.99.1") {
+				msgs = append(msgs, "chain missing ACCEPT for 10.99.99.1 after reboot")
+			}
+			if !strings.Contains(out, "DROP") {
+				msgs = append(msgs, "chain missing DROP rule after reboot")
+			}
+		}
+
+		d := time.Since(start)
+		if len(msgs) == 0 {
+			pass(38, "isolation.d: chain survives reboot (T10)", d)
+		} else {
+			fail(38, "isolation.d: reboot persistence", strings.Join(msgs, " | "), d)
+		}
+	}
+
+	// Final cleanup: destroy re-created instance A
+	run(client, fmt.Sprintf("sudo env DOCKYARD_ENV=%s ~/dockyard.sh destroy --yes 2>/dev/null; true", instA.EnvFile))
+
+done:
+	_ = isoOK
 }
 
 // checkIsolation verifies daemon-level isolation: containers from one instance
@@ -1144,7 +1744,7 @@ func main() {
 	runTests(client, *hostFlag, *portFlag, *userFlag, kp)
 	totalElapsed := time.Since(suiteStart)
 
-	total := 30 // total expected tests
+	total := 38 // total expected tests
 	passed := 0
 	for _, r := range results {
 		if r.Passed {

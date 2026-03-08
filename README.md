@@ -130,7 +130,8 @@ The installer downloads static binaries (cached in `.tmp/` for repeated installs
 |----------|---------|----------|
 | [Docker CE](https://download.docker.com/linux/static/stable/x86_64/) | 29.2.1 | dockerd, containerd, docker, ctr, runc, etc. |
 | [Docker Rootless Extras](https://download.docker.com/linux/static/stable/x86_64/) | 29.2.1 | dockerd-rootless, vpnkit, rootlesskit, etc. |
-| [Sysbox fork](https://github.com/thieso2/sysbox) | 0.6.7.9-tc | sysbox-mgr, sysbox-fs, sysbox-runc (all per-instance) |
+| [Docker Compose v2](https://github.com/docker/compose) | 2.32.4 | docker-compose (CLI plugin) |
+| [Sysbox fork](https://github.com/thieso2/sysbox) | 0.6.7.10-tc | sysbox-mgr, sysbox-fs, sysbox-runc (all per-instance) |
 
 All three sysbox binaries are per-instance. There is no shared sysbox host daemon.
 
@@ -140,7 +141,8 @@ ${DOCKYARD_ROOT}/                       # owned by ${PREFIX}docker user/group
 │                                       # sysbox-runc, docker (DOCKER_HOST wrapper), dockyard.sh, dockyardctl→dockyard.sh
 ├── etc/
 │   ├── daemon.json                     # Daemon configuration
-│   └── dockyard.env                    # Copy of config (written by create)
+│   ├── dockyard.env                    # Copy of config (written by create)
+│   └── isolation.d/                    # Optional: .rules files for DOCKYARD-ISOLATION chain
 ├── lib/
 │   ├── docker/                         # Images, containers, volumes
 │   │   └── containerd/
@@ -198,13 +200,13 @@ export DOCKER_HOST=unix:///dockyard/run/docker.sock
 
 Nestybox sysbox 0.6.7 CE hardcodes its socket paths (`/run/sysbox/sysmgr.sock`, `/run/sysbox/sysfs.sock`) with no flag to change them. Only one sysbox-mgr + sysbox-fs pair can run per host, which conflicts with the goal of fully independent per-instance isolation.
 
-The fork (`github.com/thieso2/sysbox`, version `0.6.7.9-tc`) adds `--run-dir <dir>` to all three sysbox binaries. Each dockyard instance points its sysbox pair at `${DOCKYARD_ROOT}/run/sysbox/`, giving N fully isolated sysbox instances on the same host. `--run-dir` is passed via `runtimeArgs` in `daemon.json` — no wrapper script needed.
+The fork (`github.com/thieso2/sysbox`, version `0.6.7.10-tc`) adds `--run-dir <dir>` to all three sysbox binaries. Each dockyard instance points its sysbox pair at `${DOCKYARD_ROOT}/run/sysbox/`, giving N fully isolated sysbox instances on the same host. `--run-dir` is passed via `runtimeArgs` in `daemon.json` — no wrapper script needed.
 
 ## Prerequisites
 
 - **Not Ubuntu 25.10** — Ubuntu 25.10's kernel (`6.17.0-14-generic`) is **not compatible**: it carries a patch that prevents `mount --make-private /` inside a user namespace, causing sysbox-runc to fail with `EPERM`. Mainline kernels 6.16, 6.17, and 6.18 are all confirmed working. Replace the Ubuntu 25.10 kernel with a mainline build from `kernel.ubuntu.com/mainline` to use dockyard on that distro. See [FINDINGS.md](FINDINGS.md) for details.
 - Linux with systemd
-- x86_64 architecture (arm64 not yet supported)
+- x86_64 or aarch64 architecture
 - `curl` and `tar` for binary downloads
 - `iptables` and `rsync` (required by sysbox; present on Ubuntu 24.04, may need `apt-get install -y iptables rsync` on Ubuntu 25.04+)
 - Root access for installation

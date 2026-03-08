@@ -12,6 +12,7 @@ Dockyard: multi-instance Docker daemon installer with sysbox-runc as default run
 # Build dist/dockyard.sh from src/*.sh (concatenates in numeric order, strips per-file shebangs)
 ./build.sh
 
+# Go is managed by mise (.mise.toml); run `mise install` once, then:
 # Build the integration test binary (run from repo root)
 GOOS=linux GOARCH=amd64 go build -o cmd/dockyardtest/dockyardtest_linux ./cmd/dockyardtest/
 GOOS=linux GOARCH=arm64 go build -o cmd/dockyardtest/dockyardtest_linux_arm64 ./cmd/dockyardtest/
@@ -25,14 +26,28 @@ The `dockyard.sh` at the repo root is the working copy (not a symlink). `dist/do
 The test suite (`cmd/dockyardtest/main.go`) SSHes into a remote Linux VM and runs 29 end-to-end tests across 3 dockyard instances.
 
 ```bash
-# Upload dist + binary to target host, then run
-./dockyardtest_mac --host HOST --user thies [--key /path/to/key]
+# Run against a test VM (uploads dist/dockyard.sh automatically)
+./dockyardtest_mac --host HOST --user thies [--key /path/to/key] [--port PORT]
+
+# Sandcastle iso-test VM (via Tailscale)
+./cmd/dockyardtest/dockyardtest_mac --host 100.106.185.92 --user thies --port 2223
 
 # Run a specific test by name (substring match on test subject)
 ./dockyardtest_mac --host HOST --user thies --run "verify"
 ```
 
-See MEMORY.md for known test VM addresses and cross-host SSH key setup.
+### Test VM Setup (Sandcastle)
+
+The `iso-test` VM on sandcastle (100.106.185.92) runs the full 38-test suite:
+- Incus VM: `incus launch images:ubuntu/noble iso-test --vm -c limits.cpu=4 -c limits.memory=8GiB -d root,size=50GiB`
+- Static IP: 10.50.0.20/24 via netplan on enp5s0, gateway 10.50.0.1
+- SSH: port-forwarded from host :2223 → VM :22
+- DNS: systemd-resolved with 1.1.1.1/8.8.8.8
+- Host iptables: FORWARD rules for incusbr0 + NAT MASQUERADE for 10.50.0.0/24
+- Prereqs: `openssh-server iptables rsync fuse3 iproute2 jq curl`
+- Alpine cache: `/var/tmp/alpine.tar` (bootstrapped via a temporary dockyard instance)
+
+See MEMORY.md for full infrastructure details.
 
 ## Key Commands
 
@@ -176,6 +191,14 @@ Docker's built-in iptables management (`--iptables=true`) uses global chain name
 
 Each rule uses `-i $BRIDGE` or `-o $BRIDGE` so instances can never interfere with each other or with the system Docker.
 
+### Isolation Rules (`isolation.d/`)
+
+Consumers (e.g. Sandcastle) can drop `.rules` files into `${ETC_DIR}/isolation.d/` to enable intra-bridge traffic filtering. Each `.rules` file contains one IP per line to ACCEPT; all other traffic between containers on the same user-defined bridge is DROPped.
+
+When `.rules` files exist, dockyard creates a per-instance `DOCKYARD-ISO-${PREFIX}` iptables chain (e.g. `DOCKYARD-ISO-dy1`) on start and inserts bridge-scoped jump rules (`-i br-xxx -o br-xxx -j DOCKYARD-ISO-dy1`) for every user-defined Docker network. On stop, the chain and all jump rules are cleaned up. Comments (`#`) and blank lines in `.rules` files are ignored.
+
+This is a generic hook — dockyard itself never writes `.rules` files.
+
 ### Directory Layout (per instance)
 
 ```
@@ -184,7 +207,8 @@ ${DOCKYARD_ROOT}/                        # owned by ${INSTANCE_USER}:${INSTANCE_
 │                                        # sysbox-runc, docker-cli, docker (wrapper), dockyard.sh (dockyardctl symlink)
 ├── etc/
 │   ├── daemon.json                      # Docker daemon config
-│   └── dockyard.env                     # Copy of config (written by create)
+│   ├── dockyard.env                     # Copy of config (written by create)
+│   └── isolation.d/                     # Optional: .rules files for DOCKYARD-ISOLATION chain
 ├── lib/
 │   ├── docker/                          # Docker data-root (images, containers, volumes)
 │   │   └── containerd/                  # containerd content store
@@ -235,6 +259,10 @@ ${DOCKYARD_ROOT}/                        # owned by ${INSTANCE_USER}:${INSTANCE_
 - `ARCHITECTURE.md` — comprehensive design doc with mermaid diagrams
 - `FINDINGS.md` — root cause analysis of all discovered issues
 - `PROGRESS.md` — architecture summary and test phase breakdown
+
+## Downstream: Sandcastle
+
+Sandcastle (`thieso2/Sandcastle`) bundles a copy of dockyard at `installer/templates/dockyard.sh`. **Never fix dockyard bugs in the Sandcastle copy** — always fix them here in the dockyard repo first, then update the Sandcastle template to match. The Sandcastle template should only contain Sandcastle-specific additions (not divergent fixes to dockyard code).
 
 ## Script Conventions
 

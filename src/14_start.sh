@@ -64,8 +64,10 @@ cmd_start() {
         echo "Bridge ${BRIDGE} already exists"
     fi
 
-    # Enable IP forwarding
+    # Enable IP forwarding and bridge netfilter (needed for isolation.d iptables on bridge traffic)
     sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    modprobe br_netfilter 2>/dev/null || true
+    sysctl -w net.bridge.bridge-nf-call-iptables=1 >/dev/null 2>&1 || true
 
     # Bridge rules (idempotent)
     iptables -C FORWARD -i "$BRIDGE" -o "$BRIDGE" -j ACCEPT 2>/dev/null ||
@@ -119,6 +121,38 @@ cmd_start() {
 
     wait_for_file "$DOCKER_SOCKET" "dockerd" 30 || cleanup
     echo "  dockerd ready (pid ${DOCKERD_PID})"
+
+    # Apply isolation rules from ${ETC_DIR}/isolation.d/ if any .rules files exist.
+    # Each .rules file lists IPs to ACCEPT; all other intra-bridge traffic is DROPped.
+    local isolation_dir="${ETC_DIR}/isolation.d"
+    local iso_chain="DOCKYARD-ISO-${DOCKYARD_DOCKER_PREFIX%_}"
+    if ls "${isolation_dir}"/*.rules >/dev/null 2>&1; then
+        # Build the chain once (not per-bridge)
+        iptables -L "$iso_chain" >/dev/null 2>&1 || iptables -N "$iso_chain"
+        iptables -F "$iso_chain"
+        iptables -A "$iso_chain" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        for f in "${isolation_dir}"/*.rules; do
+            [ -f "$f" ] || continue
+            while IFS= read -r line; do
+                line="${line%%#*}"          # strip comments
+                line="${line// /}"          # strip spaces
+                [ -n "$line" ] || continue
+                iptables -A "$iso_chain" -s "$line" -j ACCEPT
+                iptables -A "$iso_chain" -d "$line" -j ACCEPT
+            done < "$f"
+        done
+        iptables -A "$iso_chain" -j DROP
+
+        # Add per-bridge jump rules for this instance's user-defined networks
+        for net_id in $("${BIN_DIR}/docker-cli" -H "unix://${DOCKER_SOCKET}" network ls \
+                --filter driver=bridge --format '{{.ID}}' 2>/dev/null); do
+            local br="br-${net_id:0:12}"
+            ip link show "$br" &>/dev/null || continue
+            iptables -C FORWARD -i "$br" -o "$br" -j "$iso_chain" 2>/dev/null ||
+                iptables -I FORWARD -i "$br" -o "$br" -j "$iso_chain"
+            echo "  isolation rules applied on ${br}"
+        done
+    fi
 
     echo "=== All daemons started ==="
     echo "Run: DOCKER_HOST=unix://${DOCKER_SOCKET} docker ps"
