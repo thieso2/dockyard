@@ -71,6 +71,14 @@ iptables -t nat -I POSTROUTING -s ${FIXED_CIDR} ! -o ${BRIDGE} -j MASQUERADE
 
 Because every rule references `${BRIDGE}` (e.g. `dy1_docker0`), instances are mathematically incapable of interfering with each other. Teardown is equally clean: `ExecStopPost` removes the same four rules with `-D`.
 
+#### Isolation rules (`isolation.d/`)
+
+Consumers (e.g. Sandcastle) can drop `.rules` files into `${ETC_DIR}/isolation.d/` to enable intra-bridge traffic filtering. Each `.rules` file contains one IP per line to ACCEPT; all other traffic between containers on the same user-defined bridge is DROPped.
+
+When `.rules` files exist, dockyard creates a `DOCKYARD-ISOLATION` iptables chain on start and inserts bridge-scoped jump rules (`-i br-xxx -o br-xxx -j DOCKYARD-ISOLATION`) for every user-defined Docker network. On stop, the chain and all jump rules are cleaned up.
+
+This is a generic hook — dockyard itself never writes `.rules` files.
+
 **Why not nftables?** iptables is still the lowest common denominator for Ubuntu LTS, Debian, and the Alpine-derived VMs this tooling targets. nftables support is a natural future addition.
 
 ---
@@ -86,7 +94,7 @@ Because every rule references `${BRIDGE}` (e.g. `dy1_docker0`), instances are ma
 
 There is no flag to change them. Running two sysbox-mgr processes on the same host is physically impossible — they fight over the same socket file. An earlier architecture worked around this by using a single shared `dockyard-sysbox.service`, but that means all instances share one sysbox process.
 
-**The solution: fork sysbox.** The fork (`github.com/thieso2/sysbox`, version `0.6.7.9-tc`) adds `--run-dir <dir>` to all three sysbox binaries — `sysbox-mgr`, `sysbox-fs`, and `sysbox-runc`. `SetRunDir()` calls `os.Setenv("SYSBOX_RUN_DIR", dir)`, so passing `--run-dir` via `runtimeArgs` in `daemon.json` works correctly for all sockets including the seccomp tracer. No wrapper script is needed.
+**The solution: fork sysbox.** The fork (`github.com/thieso2/sysbox`, version `0.6.7.10-tc`) adds `--run-dir <dir>` to all three sysbox binaries — `sysbox-mgr`, `sysbox-fs`, and `sysbox-runc`. `SetRunDir()` calls `os.Setenv("SYSBOX_RUN_DIR", dir)`, so passing `--run-dir` via `runtimeArgs` in `daemon.json` works correctly for all sockets including the seccomp tracer. No wrapper script is needed.
 
 Each dockyard instance points its sysbox pair at its own directories (FHS layout):
 
@@ -118,7 +126,8 @@ Versions are pinned explicitly in `cmd_create()`:
 |--------|---------|--------|
 | Docker CE static | 29.2.1 | download.docker.com |
 | Docker Rootless Extras | 29.2.1 | download.docker.com |
-| Sysbox fork (static tarball) | 0.6.7.9-tc | github.com/thieso2/sysbox |
+| Docker Compose v2 | 2.32.4 | github.com/docker/compose |
+| Sysbox fork (static tarball) | 0.6.7.10-tc | github.com/thieso2/sysbox |
 
 ---
 
@@ -318,7 +327,8 @@ ${DOCKYARD_ROOT}/
 │                              sysbox-mgr, sysbox-fs, sysbox-runc
 ├── etc/
 │   ├── daemon.json            Generated daemon config
-│   └── dockyard.env           Copy of the env file for this instance
+│   ├── dockyard.env           Copy of the env file for this instance
+│   └── isolation.d/           Optional: .rules files for DOCKYARD-ISOLATION chain
 ├── lib/
 │   ├── docker/                Docker data root (images, containers, volumes)
 │   │   └── containerd/        Containerd content store
@@ -428,7 +438,7 @@ The separation between instances is strict: membership in `dy2_docker` conveys z
 
 ## Test Suite
 
-The integration test suite (`cmd/dockyardtest/main.go`) runs 28 tests against a real Linux VM over SSH. It covers the full instance lifecycle including edge cases:
+The integration test suite (`cmd/dockyardtest/main.go`) runs 30 tests against a real Linux VM over SSH. It covers the full instance lifecycle including edge cases:
 
 | Phase | Tests | What is verified |
 |-------|-------|-----------------|
@@ -438,17 +448,19 @@ The integration test suite (`cmd/dockyardtest/main.go`) runs 28 tests against a 
 | Container basics | 07–09 | Container run, outbound ping, DNS resolution on all instances |
 | Docker-in-Docker | 10–12 | DinD start (no --privileged), inner container, inner networking |
 | Isolation | 13 | All pairs: containers from A not visible in B or C |
-| Stop/start cycle | 14 | systemctl stop then start, iptables re-injected, containers run |
-| Socket permissions | 15 | Socket not world-accessible; group-owned by `${PREFIX}docker` |
-| Destroy under load | 16 | Destroy A while a container is running — must succeed cleanly |
-| Idempotent destroy | 17 | Second destroy on already-destroyed instance returns exit 0 |
-| Cleanup check | 18 | A's service, bridge, and iptables rules all gone |
-| Survivor check | 19 | B+C unaffected by A's destruction |
-| Reboot | 20 | Full host reboot; B+C must come back automatically via systemd |
-| Post-reboot health | 21–24 | Services, containers, networking, DinD — all on B+C |
-| Final teardown | 25–26 | Destroy B and C |
-| Full cleanup | 27 | No residual services, bridges, iptables, data dirs, users/groups |
-| Nested root | 28 | DOCKYARD_ROOT at a deeply nested path (e.g. `/tmp/a/b/c/dockyard`) — full lifecycle |
+| Verify | 14 | All instances: `verify` subcommand passes (6/6 checks) |
+| Stop/start cycle | 15 | systemctl stop then start, iptables re-injected, containers run |
+| Socket permissions | 16 | Socket not world-accessible; group-owned by `${PREFIX}docker` |
+| Sysbox bind-mount | 17 | mkdir inside bind-mounted 777 dirs with sysbox user namespaces |
+| Destroy under load | 18 | Destroy A while a container is running — must succeed cleanly |
+| Idempotent destroy | 19 | Second destroy on already-destroyed instance returns exit 0 |
+| Cleanup check | 20 | A's service, bridge, and iptables rules all gone |
+| Survivor check | 21 | B+C unaffected by A's destruction |
+| Reboot | 22 | Full host reboot; B+C must come back automatically via systemd |
+| Post-reboot health | 23–26 | Services, containers, networking, DinD — all on B+C |
+| Final teardown | 27–28 | Destroy B and C |
+| Full cleanup | 29 | No residual services, bridges, iptables, data dirs, users/groups |
+| Nested root | 30 | DOCKYARD_ROOT at a deeply nested path (e.g. `/tmp/a/b/c/dockyard`) — full lifecycle |
 
 Tests 05, 07–13, 19–24 run instance-level checks concurrently using goroutines. Results are sorted by instance label before printing to ensure deterministic output.
 

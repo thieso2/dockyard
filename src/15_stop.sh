@@ -21,6 +21,13 @@ cmd_stop() {
     iptables -D FORWARD -d "$DOCKYARD_POOL_BASE" -j ACCEPT 2>/dev/null || true
     iptables -t nat -D POSTROUTING -s "$DOCKYARD_POOL_BASE" -j MASQUERADE 2>/dev/null || true
 
+    # Remove isolation chain and its jump rules from all user-defined bridges
+    for br in $(ip -o link show type bridge 2>/dev/null | grep -oP 'br-[0-9a-f]+'); do
+        iptables -D FORWARD -i "$br" -o "$br" -j DOCKYARD-ISOLATION 2>/dev/null || true
+    done
+    iptables -F DOCKYARD-ISOLATION 2>/dev/null || true
+    iptables -X DOCKYARD-ISOLATION 2>/dev/null || true
+
     # Remove bridge
     if ip link show "$BRIDGE" &>/dev/null; then
         ip link set "$BRIDGE" down

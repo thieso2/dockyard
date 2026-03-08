@@ -176,6 +176,14 @@ Docker's built-in iptables management (`--iptables=true`) uses global chain name
 
 Each rule uses `-i $BRIDGE` or `-o $BRIDGE` so instances can never interfere with each other or with the system Docker.
 
+### Isolation Rules (`isolation.d/`)
+
+Consumers (e.g. Sandcastle) can drop `.rules` files into `${ETC_DIR}/isolation.d/` to enable intra-bridge traffic filtering. Each `.rules` file contains one IP per line to ACCEPT; all other traffic between containers on the same user-defined bridge is DROPped.
+
+When `.rules` files exist, dockyard creates a `DOCKYARD-ISOLATION` iptables chain on start and inserts bridge-scoped jump rules (`-i br-xxx -o br-xxx -j DOCKYARD-ISOLATION`) for every user-defined Docker network. On stop, the chain and all jump rules are cleaned up.
+
+This is a generic hook — dockyard itself never writes `.rules` files.
+
 ### Directory Layout (per instance)
 
 ```
@@ -184,7 +192,8 @@ ${DOCKYARD_ROOT}/                        # owned by ${INSTANCE_USER}:${INSTANCE_
 │                                        # sysbox-runc, docker-cli, docker (wrapper), dockyard.sh (dockyardctl symlink)
 ├── etc/
 │   ├── daemon.json                      # Docker daemon config
-│   └── dockyard.env                     # Copy of config (written by create)
+│   ├── dockyard.env                     # Copy of config (written by create)
+│   └── isolation.d/                     # Optional: .rules files for DOCKYARD-ISOLATION chain
 ├── lib/
 │   ├── docker/                          # Docker data-root (images, containers, volumes)
 │   │   └── containerd/                  # containerd content store
@@ -235,6 +244,10 @@ ${DOCKYARD_ROOT}/                        # owned by ${INSTANCE_USER}:${INSTANCE_
 - `ARCHITECTURE.md` — comprehensive design doc with mermaid diagrams
 - `FINDINGS.md` — root cause analysis of all discovered issues
 - `PROGRESS.md` — architecture summary and test phase breakdown
+
+## Downstream: Sandcastle
+
+Sandcastle (`thieso2/Sandcastle`) bundles a copy of dockyard at `installer/templates/dockyard.sh`. **Never fix dockyard bugs in the Sandcastle copy** — always fix them here in the dockyard repo first, then update the Sandcastle template to match. The Sandcastle template should only contain Sandcastle-specific additions (not divergent fixes to dockyard code).
 
 ## Script Conventions
 

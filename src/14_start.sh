@@ -120,6 +120,38 @@ cmd_start() {
     wait_for_file "$DOCKER_SOCKET" "dockerd" 30 || cleanup
     echo "  dockerd ready (pid ${DOCKERD_PID})"
 
+    # Apply isolation rules from ${ETC_DIR}/isolation.d/ if any .rules files exist.
+    # Each .rules file lists IPs to ACCEPT; all other intra-bridge traffic is DROPped.
+    local isolation_dir="${ETC_DIR}/isolation.d"
+    if ls "${isolation_dir}"/*.rules >/dev/null 2>&1; then
+        for net in $("${BIN_DIR}/docker-cli" -H "unix://${DOCKER_SOCKET}" network ls --filter driver=bridge --format '{{.Name}}' 2>/dev/null); do
+            [ "$net" = "bridge" ] && continue
+            local net_id
+            net_id=$("${BIN_DIR}/docker-cli" -H "unix://${DOCKER_SOCKET}" network inspect "$net" \
+                --format '{{.Id}}' 2>/dev/null | head -c 12) || continue
+            local br="br-${net_id}"
+            ip link show "$br" &>/dev/null || continue
+
+            iptables -L DOCKYARD-ISOLATION >/dev/null 2>&1 || iptables -N DOCKYARD-ISOLATION
+            iptables -F DOCKYARD-ISOLATION
+            iptables -A DOCKYARD-ISOLATION -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+            if [ -d "${isolation_dir}" ]; then
+                for f in "${isolation_dir}"/*.rules; do
+                    [ -f "$f" ] || continue
+                    while IFS= read -r ip; do
+                        [ -n "$ip" ] || continue
+                        iptables -A DOCKYARD-ISOLATION -s "$ip" -j ACCEPT
+                        iptables -A DOCKYARD-ISOLATION -d "$ip" -j ACCEPT
+                    done < "$f"
+                done
+            fi
+            iptables -A DOCKYARD-ISOLATION -j DROP
+            iptables -C FORWARD -i "$br" -o "$br" -j DOCKYARD-ISOLATION 2>/dev/null ||
+                iptables -I FORWARD -i "$br" -o "$br" -j DOCKYARD-ISOLATION
+            echo "  isolation rules applied on ${br}"
+        done
+    fi
+
     echo "=== All daemons started ==="
     echo "Run: DOCKER_HOST=unix://${DOCKER_SOCKET} docker ps"
 }
