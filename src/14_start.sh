@@ -123,31 +123,31 @@ cmd_start() {
     # Apply isolation rules from ${ETC_DIR}/isolation.d/ if any .rules files exist.
     # Each .rules file lists IPs to ACCEPT; all other intra-bridge traffic is DROPped.
     local isolation_dir="${ETC_DIR}/isolation.d"
+    local iso_chain="DOCKYARD-ISO-${DOCKYARD_DOCKER_PREFIX%_}"
     if ls "${isolation_dir}"/*.rules >/dev/null 2>&1; then
-        for net in $("${BIN_DIR}/docker-cli" -H "unix://${DOCKER_SOCKET}" network ls --filter driver=bridge --format '{{.Name}}' 2>/dev/null); do
-            [ "$net" = "bridge" ] && continue
-            local net_id
-            net_id=$("${BIN_DIR}/docker-cli" -H "unix://${DOCKER_SOCKET}" network inspect "$net" \
-                --format '{{.Id}}' 2>/dev/null | head -c 12) || continue
-            local br="br-${net_id}"
-            ip link show "$br" &>/dev/null || continue
+        # Build the chain once (not per-bridge)
+        iptables -L "$iso_chain" >/dev/null 2>&1 || iptables -N "$iso_chain"
+        iptables -F "$iso_chain"
+        iptables -A "$iso_chain" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        for f in "${isolation_dir}"/*.rules; do
+            [ -f "$f" ] || continue
+            while IFS= read -r line; do
+                line="${line%%#*}"          # strip comments
+                line="${line// /}"          # strip spaces
+                [ -n "$line" ] || continue
+                iptables -A "$iso_chain" -s "$line" -j ACCEPT
+                iptables -A "$iso_chain" -d "$line" -j ACCEPT
+            done < "$f"
+        done
+        iptables -A "$iso_chain" -j DROP
 
-            iptables -L DOCKYARD-ISOLATION >/dev/null 2>&1 || iptables -N DOCKYARD-ISOLATION
-            iptables -F DOCKYARD-ISOLATION
-            iptables -A DOCKYARD-ISOLATION -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-            if [ -d "${isolation_dir}" ]; then
-                for f in "${isolation_dir}"/*.rules; do
-                    [ -f "$f" ] || continue
-                    while IFS= read -r ip; do
-                        [ -n "$ip" ] || continue
-                        iptables -A DOCKYARD-ISOLATION -s "$ip" -j ACCEPT
-                        iptables -A DOCKYARD-ISOLATION -d "$ip" -j ACCEPT
-                    done < "$f"
-                done
-            fi
-            iptables -A DOCKYARD-ISOLATION -j DROP
-            iptables -C FORWARD -i "$br" -o "$br" -j DOCKYARD-ISOLATION 2>/dev/null ||
-                iptables -I FORWARD -i "$br" -o "$br" -j DOCKYARD-ISOLATION
+        # Add per-bridge jump rules for this instance's user-defined networks
+        for net_id in $("${BIN_DIR}/docker-cli" -H "unix://${DOCKER_SOCKET}" network ls \
+                --filter driver=bridge --format '{{.ID}}' 2>/dev/null); do
+            local br="br-${net_id:0:12}"
+            ip link show "$br" &>/dev/null || continue
+            iptables -C FORWARD -i "$br" -o "$br" -j "$iso_chain" 2>/dev/null ||
+                iptables -I FORWARD -i "$br" -o "$br" -j "$iso_chain"
             echo "  isolation rules applied on ${br}"
         done
     fi

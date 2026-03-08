@@ -110,6 +110,8 @@ STACKEOF
     chmod 755 "${BIN_DIR}/dockyard-stack"
     echo "  installed ${BIN_DIR}/dockyard-stack"
 
+    local ISO_CHAIN="DOCKYARD-ISO-${DOCKYARD_DOCKER_PREFIX%_}"
+
     cat > "$SERVICE_FILE" <<SERVICEEOF
 [Unit]
 Description=Dockyard Docker (${SERVICE_NAME})
@@ -153,8 +155,8 @@ ExecStartPost=/bin/bash -c 'i=0; while ! ${BIN_DIR}/docker-cli -H unix://${DOCKE
 
 # Apply isolation rules from ${ETC_DIR}/isolation.d/ if any .rules files exist.
 # Each .rules file lists IPs to ACCEPT; all other intra-bridge traffic is DROPped.
-# The chain name is DOCKYARD-ISOLATION and the jump rule is scoped to user-defined bridges.
-ExecStartPost=-/bin/bash -c 'DOCKER=${BIN_DIR}/docker-cli; SOCK=unix://${DOCKER_SOCKET}; dir=${ETC_DIR}/isolation.d; ls "\$dir"/*.rules >/dev/null 2>&1 || exit 0; for net in \$(\$DOCKER -H \$SOCK network ls --filter driver=bridge --format "{{.Name}}" 2>/dev/null); do [ "\$net" = "bridge" ] && continue; net_id=\$(\$DOCKER -H \$SOCK network inspect "\$net" --format "{{.Id}}" 2>/dev/null | head -c 12) || continue; br="br-\${net_id}"; ip link show "\$br" &>/dev/null || continue; iptables -L DOCKYARD-ISOLATION >/dev/null 2>&1 || iptables -N DOCKYARD-ISOLATION; iptables -F DOCKYARD-ISOLATION; iptables -A DOCKYARD-ISOLATION -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT; for f in "\$dir"/*.rules; do [ -f "\$f" ] || continue; while IFS= read -r ip; do [ -n "\$ip" ] || continue; iptables -A DOCKYARD-ISOLATION -s "\$ip" -j ACCEPT; iptables -A DOCKYARD-ISOLATION -d "\$ip" -j ACCEPT; done < "\$f"; done 2>/dev/null; iptables -A DOCKYARD-ISOLATION -j DROP; iptables -C FORWARD -i "\$br" -o "\$br" -j DOCKYARD-ISOLATION 2>/dev/null || iptables -I FORWARD -i "\$br" -o "\$br" -j DOCKYARD-ISOLATION; done'
+# Chain ${ISO_CHAIN} is per-instance; built once, then jump rules added per user-defined bridge.
+ExecStartPost=-/bin/bash -c 'dir=${ETC_DIR}/isolation.d; ls "\$dir"/*.rules >/dev/null 2>&1 || exit 0; iptables -L ${ISO_CHAIN} >/dev/null 2>&1 || iptables -N ${ISO_CHAIN}; iptables -F ${ISO_CHAIN}; iptables -A ${ISO_CHAIN} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT; for f in "\$dir"/*.rules; do [ -f "\$f" ] || continue; while IFS= read -r line; do line="\${line%%#*}"; line="\${line// /}"; [ -n "\$line" ] || continue; iptables -A ${ISO_CHAIN} -s "\$line" -j ACCEPT; iptables -A ${ISO_CHAIN} -d "\$line" -j ACCEPT; done < "\$f"; done; iptables -A ${ISO_CHAIN} -j DROP; for net_id in \$(${BIN_DIR}/docker-cli -H unix://${DOCKER_SOCKET} network ls --filter driver=bridge --format "{{.ID}}" 2>/dev/null); do br="br-\${net_id:0:12}"; ip link show "\$br" &>/dev/null || continue; iptables -C FORWARD -i "\$br" -o "\$br" -j ${ISO_CHAIN} 2>/dev/null || iptables -I FORWARD -i "\$br" -o "\$br" -j ${ISO_CHAIN}; done'
 
 # Clean up docker/containerd sockets
 ExecStopPost=-/bin/rm -f ${DOCKER_SOCKET} ${CONTAINERD_SOCKET}
@@ -165,8 +167,8 @@ ExecStopPost=-/bin/bash -c 'iptables -D FORWARD -i ${BRIDGE} -o ${BRIDGE} -j ACC
 # Remove iptables rules (user-defined networks)
 ExecStopPost=-/bin/bash -c 'iptables -D FORWARD -s ${DOCKYARD_POOL_BASE} -j ACCEPT 2>/dev/null; iptables -D FORWARD -d ${DOCKYARD_POOL_BASE} -j ACCEPT 2>/dev/null; iptables -t nat -D POSTROUTING -s ${DOCKYARD_POOL_BASE} -j MASQUERADE 2>/dev/null'
 
-# Remove isolation chain and its jump rules from all user-defined bridges
-ExecStopPost=-/bin/bash -c 'for br in \$(ip -o link show type bridge 2>/dev/null | grep -oP "br-[0-9a-f]+"); do iptables -D FORWARD -i "\$br" -o "\$br" -j DOCKYARD-ISOLATION 2>/dev/null; done; iptables -F DOCKYARD-ISOLATION 2>/dev/null; iptables -X DOCKYARD-ISOLATION 2>/dev/null'
+# Remove per-instance isolation chain and its jump rules
+ExecStopPost=-/bin/bash -c 'for br in \$(ip -o link show type bridge 2>/dev/null | grep -oP "br-[0-9a-f]+"); do iptables -D FORWARD -i "\$br" -o "\$br" -j ${ISO_CHAIN} 2>/dev/null; done; iptables -F ${ISO_CHAIN} 2>/dev/null; iptables -X ${ISO_CHAIN} 2>/dev/null'
 
 # Remove bridge
 ExecStopPost=-/bin/bash -c 'if ip link show ${BRIDGE} &>/dev/null; then ip link set ${BRIDGE} down 2>/dev/null; ip link delete ${BRIDGE} 2>/dev/null; fi'

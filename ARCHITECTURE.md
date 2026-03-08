@@ -75,7 +75,7 @@ Because every rule references `${BRIDGE}` (e.g. `dy1_docker0`), instances are ma
 
 Consumers (e.g. Sandcastle) can drop `.rules` files into `${ETC_DIR}/isolation.d/` to enable intra-bridge traffic filtering. Each `.rules` file contains one IP per line to ACCEPT; all other traffic between containers on the same user-defined bridge is DROPped.
 
-When `.rules` files exist, dockyard creates a `DOCKYARD-ISOLATION` iptables chain on start and inserts bridge-scoped jump rules (`-i br-xxx -o br-xxx -j DOCKYARD-ISOLATION`) for every user-defined Docker network. On stop, the chain and all jump rules are cleaned up.
+When `.rules` files exist, dockyard creates a per-instance `DOCKYARD-ISO-${PREFIX}` iptables chain (e.g. `DOCKYARD-ISO-dy1`) on start and inserts bridge-scoped jump rules for every user-defined Docker network. On stop, the chain and all jump rules are cleaned up. Comments (`#`) and blank lines in `.rules` files are ignored.
 
 This is a generic hook — dockyard itself never writes `.rules` files.
 
