@@ -24,6 +24,7 @@ var (
 	userFlag    = flag.String("user", "", "SSH username (required)")
 	keyFlag     = flag.String("key", "", "Path to SSH private key (default: ~/.ssh/id_ed25519)")
 	timeoutFlag = flag.Duration("timeout", 20*time.Minute, "Overall test timeout")
+	onlyFlag    = flag.String("only", "", "Run only a specific test group: btrfs, isolation, dind, etc.")
 )
 
 // ── Instance descriptor ───────────────────────────────────────────────────────
@@ -261,6 +262,9 @@ func cleanupAllInstances(client *ssh.Client) {
 	run(client, "sudo systemctl stop dyn_docker 2>/dev/null; sudo systemctl disable dyn_docker 2>/dev/null; true")
 	run(client, "sudo rm -f /etc/systemd/system/dyn_docker.service 2>/dev/null; true")
 	run(client, "rm -rf ~/dockyard-nested-test 2>/dev/null; true")
+	// Clean up BTRFS loopback from tests 39-41
+	run(client, "sudo umount /var/tmp/btrfs-mount 2>/dev/null; true")
+	run(client, "sudo rm -rf /var/tmp/btrfs-mount /var/tmp/btrfs-test.img 2>/dev/null; true")
 	run(client, "sudo systemctl daemon-reload 2>/dev/null; true")
 }
 
@@ -1076,6 +1080,11 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 	isoChainA := "DOCKYARD-ISO-" + strings.TrimSuffix(instA.Prefix, "_")
 	isoOK := true // gates subsequent isolation tests
 
+	// BTRFS test variables (declared here to avoid goto-over-declaration)
+	btrfsOK := true
+	btrfsImg := "/var/tmp/btrfs-test.img"
+	btrfsMnt := "/var/tmp/btrfs-mount"
+
 	fmt.Println("[INFO] Re-creating instance A for isolation.d tests...")
 	{
 		_, se, c := run(client, fmt.Sprintf(
@@ -1658,11 +1667,289 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		}
 	}
 
+	//
+	// ── Phase 16: BTRFS bind mount with sysbox ──────────────────────────────
+	//
+	// Verifies that sysbox containers can use bind mounts from BTRFS
+	// filesystems without EOVERFLOW. Uses a loopback BTRFS image.
+	// See: https://github.com/thieso2/dockyard/issues/18
+	//      https://github.com/thieso2/sysbox/issues/12
+
+	fmt.Println("[INFO] Setting up BTRFS loopback for bind mount tests...")
+	{
+		// Check if mkfs.btrfs is available; skip BTRFS tests if not
+		_, _, mkfsCode := run(client, "which mkfs.btrfs")
+		if mkfsCode != 0 {
+			fmt.Println("[SKIP] mkfs.btrfs not found — skipping BTRFS tests (39-41)")
+			btrfsOK = false
+		}
+	}
+
+	if btrfsOK {
+		// Create loopback BTRFS filesystem
+		_, se, code := run(client, fmt.Sprintf(
+			"sudo truncate -s 1G %s && sudo mkfs.btrfs -f %s && "+
+				"sudo mkdir -p %s && sudo mount %s %s",
+			btrfsImg, btrfsImg, btrfsMnt, btrfsImg, btrfsMnt,
+		))
+		if code != 0 {
+			fmt.Printf("[SKIP] BTRFS setup failed: %s — skipping tests 39-41\n", strings.TrimSpace(se))
+			btrfsOK = false
+		}
+	}
+
+	// 39 — BTRFS bind mount with standard runc (baseline — should always work)
+	if btrfsOK {
+		start := time.Now()
+		testDir := btrfsMnt + "/runc-test"
+		run(client, fmt.Sprintf("sudo mkdir -p %s && sudo chmod 777 %s", testDir, testDir))
+
+		// runc doesn't use ID-mapped mounts, so BTRFS works fine
+		out, se, code := run(client, fmt.Sprintf(
+			"sudo %s run --rm --runtime=runc -v %s:/mnt alpine sh -c "+
+				"'chmod 777 /mnt && touch /mnt/hello && echo btrfs-runc-ok'",
+			instA.Docker, testDir,
+		))
+		d := time.Since(start)
+		if code == 0 && strings.Contains(out, "btrfs-runc-ok") {
+			pass(39, "BTRFS bind mount with runc (baseline)", d)
+		} else {
+			fail(39, "BTRFS bind mount with runc (baseline)", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
+			btrfsOK = false
+		}
+		run(client, fmt.Sprintf("sudo rm -rf %s", testDir))
+	}
+
+	// 40 — BTRFS bind mount with sysbox-runc (the bug case: EOVERFLOW on chmod)
+	// Sysbox uses ID-mapped mounts; BTRFS_SUPER_MAGIC was missing from the
+	// blacklist, causing chmod on the mountpoint to fail with EOVERFLOW.
+	// See: https://github.com/thieso2/sysbox/issues/12
+	if btrfsOK {
+		start := time.Now()
+		testDir := btrfsMnt + "/sysbox-test"
+		run(client, fmt.Sprintf("sudo mkdir -p %s && sudo chmod 777 %s", testDir, testDir))
+
+		// The exact repro: chmod on the bind-mounted dir triggers EOVERFLOW
+		out, se, code := run(client, fmt.Sprintf(
+			"sudo %s run --rm -v %s:/mnt alpine sh -c "+
+				"'chmod 777 /mnt && touch /mnt/hello && echo btrfs-sysbox-ok'",
+			instA.Docker, testDir,
+		))
+		d := time.Since(start)
+		if code == 0 && strings.Contains(out, "btrfs-sysbox-ok") {
+			pass(40, "BTRFS bind mount with sysbox (chmod+touch on mountpoint)", d)
+		} else {
+			fail(40, "BTRFS bind mount with sysbox (chmod+touch on mountpoint)", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
+		}
+		run(client, fmt.Sprintf("sudo rm -rf %s", testDir))
+	}
+
+	// 41 — BTRFS subvolume bind mount with sysbox-runc
+	if btrfsOK {
+		start := time.Now()
+		subvol := btrfsMnt + "/subvol-test"
+
+		// Create a BTRFS subvolume as the mount source
+		run(client, fmt.Sprintf("sudo btrfs subvolume create %s 2>/dev/null || sudo mkdir -p %s", subvol, subvol))
+		run(client, fmt.Sprintf("sudo chmod 777 %s", subvol))
+
+		out, se, code := run(client, fmt.Sprintf(
+			"sudo %s run --rm -v %s:/mnt alpine sh -c "+
+				"'chmod 777 /mnt && touch /mnt/hello && echo btrfs-subvol-ok'",
+			instA.Docker, subvol,
+		))
+		d := time.Since(start)
+		if code == 0 && strings.Contains(out, "btrfs-subvol-ok") {
+			pass(41, "BTRFS subvolume bind mount with sysbox", d)
+		} else {
+			fail(41, "BTRFS subvolume bind mount with sysbox", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
+		}
+
+		// Clean up: delete subvolume (or dir fallback), then unmount + remove image
+		run(client, fmt.Sprintf("sudo btrfs subvolume delete %s 2>/dev/null; sudo rm -rf %s 2>/dev/null; true", subvol, subvol))
+	}
+
+	// BTRFS cleanup
+	if btrfsOK {
+		run(client, fmt.Sprintf("sudo umount %s 2>/dev/null; true", btrfsMnt))
+		run(client, fmt.Sprintf("sudo rm -rf %s %s 2>/dev/null; true", btrfsMnt, btrfsImg))
+	}
+
 	// Final cleanup: destroy re-created instance A
 	run(client, fmt.Sprintf("sudo env DOCKYARD_ENV=%s ~/dockyard.sh destroy --yes 2>/dev/null; true", instA.EnvFile))
 
 done:
 	_ = isoOK
+}
+
+// ── Focused test: BTRFS ──────────────────────────────────────────────────────
+
+// runBtrfsOnly creates a single dockyard instance and runs only the BTRFS
+// bind mount tests (39-41). Use with --only btrfs for quick validation on
+// a specific kernel/distro without running the full 41-test suite.
+func runBtrfsOnly(client *ssh.Client) {
+	inst := allInstances[0]
+
+	// Cleanup any leftovers
+	fmt.Println("[INFO] Cleaning up any leftover state...")
+	run(client, fmt.Sprintf(
+		"[ -f %s ] && sudo env DOCKYARD_ENV=%s ~/dockyard.sh destroy --yes 2>/dev/null; true",
+		inst.EnvFile, inst.EnvFile,
+	))
+	// Kill any orphaned sysbox/docker processes and clear runtime state
+	run(client, "sudo pkill -9 sysbox-fs 2>/dev/null; sudo pkill -9 sysbox-mgr 2>/dev/null; sudo pkill -9 containerd 2>/dev/null; true")
+	run(client, "sleep 1; true")
+	run(client, fmt.Sprintf("sudo rm -rf %s/* %s/.[!.]* 2>/dev/null; true", inst.Root, inst.Root))
+	run(client, fmt.Sprintf("sudo ip link delete %sdocker0 2>/dev/null; true", inst.Prefix))
+	run(client, fmt.Sprintf("sudo systemctl stop %sdocker 2>/dev/null; sudo systemctl disable %sdocker 2>/dev/null; true", inst.Prefix, inst.Prefix))
+	run(client, fmt.Sprintf("sudo rm -f /etc/systemd/system/%sdocker.service 2>/dev/null; true", inst.Prefix))
+	run(client, fmt.Sprintf("rm -f %s 2>/dev/null; true", inst.EnvFile))
+	run(client, "sudo umount /var/tmp/btrfs-mount 2>/dev/null; true")
+	run(client, "sudo rm -rf /var/tmp/btrfs-mount /var/tmp/btrfs-test.img 2>/dev/null; true")
+	run(client, "sudo systemctl daemon-reload 2>/dev/null; true")
+	run(client, fmt.Sprintf("sudo systemctl reset-failed %sdocker 2>/dev/null; true", inst.Prefix))
+
+	// Upload dockyard.sh
+	{
+		start := time.Now()
+		err := upload(client, "dist/dockyard.sh", "~/dockyard.sh")
+		d := time.Since(start)
+		if err != nil {
+			fail(1, "Upload dockyard.sh", err.Error(), d)
+			return
+		}
+		pass(1, "Upload dockyard.sh", d)
+	}
+
+	// gen-env
+	{
+		start := time.Now()
+		cmd := fmt.Sprintf(
+			"rm -f %s && DOCKYARD_ENV=%s DOCKYARD_ROOT=%s DOCKYARD_DOCKER_PREFIX=%s ~/dockyard.sh gen-env",
+			inst.EnvFile, inst.EnvFile, inst.Root, inst.Prefix,
+		)
+		_, se, code := run(client, cmd)
+		d := time.Since(start)
+		if code != 0 {
+			fail(2, "gen-env", se, d)
+			return
+		}
+		pass(2, fmt.Sprintf("gen-env (%s / %s)", inst.Root, inst.Prefix), d)
+	}
+
+	// create
+	{
+		start := time.Now()
+		_, se, code := run(client, fmt.Sprintf("sudo env DOCKYARD_ENV=%s ~/dockyard.sh create", inst.EnvFile))
+		d := time.Since(start)
+		if code != 0 {
+			fail(3, "create instance", se, d)
+			return
+		}
+		pass(3, "create instance", d)
+	}
+
+	// Verify instance is healthy
+	{
+		start := time.Now()
+		out, se, code := run(client, fmt.Sprintf("sudo %s run --rm alpine echo hello", inst.Docker))
+		d := time.Since(start)
+		if code != 0 || !strings.Contains(out, "hello") {
+			fail(4, "instance health check", se, d)
+			return
+		}
+		pass(4, "instance health check (container run)", d)
+	}
+
+	// BTRFS setup
+	btrfsImg := "/var/tmp/btrfs-test.img"
+	btrfsMnt := "/var/tmp/btrfs-mount"
+
+	{
+		_, _, mkfsCode := run(client, "which mkfs.btrfs")
+		if mkfsCode != 0 {
+			fmt.Println("[SKIP] mkfs.btrfs not found — install btrfs-progs")
+			return
+		}
+	}
+
+	{
+		_, se, code := run(client, fmt.Sprintf(
+			"sudo truncate -s 1G %s && sudo mkfs.btrfs -f %s && "+
+				"sudo mkdir -p %s && sudo mount %s %s",
+			btrfsImg, btrfsImg, btrfsMnt, btrfsImg, btrfsMnt,
+		))
+		if code != 0 {
+			fmt.Printf("[SKIP] BTRFS setup failed: %s\n", strings.TrimSpace(se))
+			return
+		}
+	}
+
+	// 39 — BTRFS bind mount with runc (baseline)
+	{
+		start := time.Now()
+		testDir := btrfsMnt + "/runc-test"
+		run(client, fmt.Sprintf("sudo mkdir -p %s && sudo chmod 777 %s", testDir, testDir))
+
+		out, se, code := run(client, fmt.Sprintf(
+			"sudo %s run --rm --runtime=runc -v %s:/mnt alpine sh -c "+
+				"'chmod 777 /mnt && touch /mnt/hello && echo btrfs-runc-ok'",
+			inst.Docker, testDir,
+		))
+		d := time.Since(start)
+		if code == 0 && strings.Contains(out, "btrfs-runc-ok") {
+			pass(39, "BTRFS bind mount with runc (baseline)", d)
+		} else {
+			fail(39, "BTRFS bind mount with runc (baseline)", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
+		}
+		run(client, fmt.Sprintf("sudo rm -rf %s", testDir))
+	}
+
+	// 40 — BTRFS bind mount with sysbox-runc (the bug case)
+	{
+		start := time.Now()
+		testDir := btrfsMnt + "/sysbox-test"
+		run(client, fmt.Sprintf("sudo mkdir -p %s && sudo chmod 777 %s", testDir, testDir))
+
+		out, se, code := run(client, fmt.Sprintf(
+			"sudo %s run --rm -v %s:/mnt alpine sh -c "+
+				"'chmod 777 /mnt && touch /mnt/hello && echo btrfs-sysbox-ok'",
+			inst.Docker, testDir,
+		))
+		d := time.Since(start)
+		if code == 0 && strings.Contains(out, "btrfs-sysbox-ok") {
+			pass(40, "BTRFS bind mount with sysbox (chmod+touch on mountpoint)", d)
+		} else {
+			fail(40, "BTRFS bind mount with sysbox (chmod+touch on mountpoint)", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
+		}
+		run(client, fmt.Sprintf("sudo rm -rf %s", testDir))
+	}
+
+	// 41 — BTRFS subvolume bind mount with sysbox-runc
+	{
+		start := time.Now()
+		subvol := btrfsMnt + "/subvol-test"
+		run(client, fmt.Sprintf("sudo btrfs subvolume create %s 2>/dev/null || sudo mkdir -p %s", subvol, subvol))
+		run(client, fmt.Sprintf("sudo chmod 777 %s", subvol))
+
+		out, se, code := run(client, fmt.Sprintf(
+			"sudo %s run --rm -v %s:/mnt alpine sh -c "+
+				"'chmod 777 /mnt && touch /mnt/hello && echo btrfs-subvol-ok'",
+			inst.Docker, subvol,
+		))
+		d := time.Since(start)
+		if code == 0 && strings.Contains(out, "btrfs-subvol-ok") {
+			pass(41, "BTRFS subvolume bind mount with sysbox", d)
+		} else {
+			fail(41, "BTRFS subvolume bind mount with sysbox", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
+		}
+		run(client, fmt.Sprintf("sudo btrfs subvolume delete %s 2>/dev/null; sudo rm -rf %s 2>/dev/null; true", subvol, subvol))
+	}
+
+	// Cleanup
+	run(client, fmt.Sprintf("sudo umount %s 2>/dev/null; true", btrfsMnt))
+	run(client, fmt.Sprintf("sudo rm -rf %s %s 2>/dev/null; true", btrfsMnt, btrfsImg))
+	run(client, fmt.Sprintf("sudo env DOCKYARD_ENV=%s ~/dockyard.sh destroy --yes 2>/dev/null; true", inst.EnvFile))
 }
 
 // checkIsolation verifies daemon-level isolation: containers from one instance
@@ -1741,10 +2028,24 @@ func main() {
 	defer cancel()
 
 	suiteStart := time.Now()
-	runTests(client, *hostFlag, *portFlag, *userFlag, kp)
+
+	switch strings.ToLower(*onlyFlag) {
+	case "btrfs":
+		fmt.Println("[INFO] Running BTRFS-only test mode")
+		runBtrfsOnly(client)
+	case "":
+		runTests(client, *hostFlag, *portFlag, *userFlag, kp)
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown --only value: %s (supported: btrfs)\n", *onlyFlag)
+		os.Exit(1)
+	}
+
 	totalElapsed := time.Since(suiteStart)
 
-	total := 38 // total expected tests
+	total := len(results) // in focused mode, count only what ran
+	if *onlyFlag == "" {
+		total = 41 // full suite expected count
+	}
 	passed := 0
 	for _, r := range results {
 		if r.Passed {
