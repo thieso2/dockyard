@@ -262,7 +262,7 @@ func cleanupAllInstances(client *ssh.Client) {
 	run(client, "sudo systemctl stop dyn_docker 2>/dev/null; sudo systemctl disable dyn_docker 2>/dev/null; true")
 	run(client, "sudo rm -f /etc/systemd/system/dyn_docker.service 2>/dev/null; true")
 	run(client, "rm -rf ~/dockyard-nested-test 2>/dev/null; true")
-	// Clean up BTRFS loopback from tests 39-41
+	// Clean up BTRFS loopback from tests 40-42
 	run(client, "sudo umount /var/tmp/btrfs-mount 2>/dev/null; true")
 	run(client, "sudo rm -rf /var/tmp/btrfs-mount /var/tmp/btrfs-test.img 2>/dev/null; true")
 	run(client, "sudo systemctl daemon-reload 2>/dev/null; true")
@@ -1278,27 +1278,113 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 			}
 		}
 
-		// T4: tenant-a CANNOT reach tenant-b (neither is in allow-list → DROP)
+		// T4: tenant-a CAN reach tenant-b (both on same bridge subnet → auto-whitelisted)
 		if len(msgs) == 0 {
-			_, _, c = run(client, fmt.Sprintf(
+			out, _, c := run(client, fmt.Sprintf(
 				"sudo %s exec tenant-a ping -c2 -W3 %s", docker, tenantBIP,
 			))
-			if c == 0 {
-				msgs = append(msgs, "tenant-a CAN reach tenant-b ("+tenantBIP+") — should be blocked")
+			if c != 0 || strings.Contains(out, "100% packet loss") {
+				msgs = append(msgs, "tenant-a cannot reach tenant-b ("+tenantBIP+") — same-bridge traffic should pass")
 			}
 		}
 
 		// Leave containers and network for subsequent tests
 		d := time.Since(start)
 		if len(msgs) == 0 {
-			pass(32, "isolation.d: allowed IPs pass, non-allowed blocked (T3+T4)", d)
+			pass(32, "isolation.d: allowed IPs pass, same-bridge peers communicate (T3+T4)", d)
 		} else {
 			fail(32, "isolation.d: traffic filtering", strings.Join(msgs, " | "), d)
 			isoOK = false
 		}
 	}
 
-	// 33 — T5: isolation chain cleaned up on stop, recreated on start
+	// 33 — T11: sidecar pattern — two non-whitelisted containers on a
+	//          dedicated bridge can communicate (same-bridge auto-whitelist)
+	//
+	// Reproduces the Tailscale sidecar bug: a sidecar and sandbox container
+	// are placed on a per-user bridge. Neither IP is in .rules, but they
+	// must be able to reach each other because they share the same L2 segment.
+	if isoOK {
+		start := time.Now()
+		docker := instA.Docker
+		var msgs []string
+
+		sidecarNet := "sidecar-test-net"
+		sidecarSubnet := "10.88.88.0/24"
+		sidecarIP := "10.88.88.2"
+		sandboxIP := "10.88.88.3"
+
+		// Create a dedicated bridge (like sc-ts-net-{user})
+		run(client, fmt.Sprintf("sudo %s network rm %s 2>/dev/null; true", docker, sidecarNet))
+		_, se, c := run(client, fmt.Sprintf(
+			"sudo %s network create --subnet %s %s",
+			docker, sidecarSubnet, sidecarNet,
+		))
+		if c != 0 {
+			msgs = append(msgs, "create network: "+se)
+		}
+
+		// Restart to pick up new bridge and apply isolation rules
+		if len(msgs) == 0 {
+			run(client, fmt.Sprintf("sudo systemctl reset-failed %sdocker 2>/dev/null; true", instA.Prefix))
+			_, se, c = run(client, fmt.Sprintf("sudo systemctl restart %sdocker", instA.Prefix))
+			if c != 0 {
+				msgs = append(msgs, "restart: "+se)
+			} else {
+				time.Sleep(5 * time.Second)
+			}
+		}
+
+		// Start two containers — neither IP is in any .rules file
+		if len(msgs) == 0 {
+			for _, ct := range []struct{ name, ip string }{
+				{"sidecar", sidecarIP}, {"sandbox", sandboxIP},
+			} {
+				run(client, fmt.Sprintf("sudo %s rm -f %s 2>/dev/null", docker, ct.name))
+				_, se, c = run(client, fmt.Sprintf(
+					"sudo %s run -d --name %s --network %s --ip %s alpine sleep 300",
+					docker, ct.name, sidecarNet, ct.ip,
+				))
+				if c != 0 {
+					msgs = append(msgs, "start "+ct.name+": "+se)
+				}
+			}
+		}
+
+		// Sidecar must be able to reach sandbox (same bridge)
+		if len(msgs) == 0 {
+			out, _, c := run(client, fmt.Sprintf(
+				"sudo %s exec sidecar ping -c2 -W3 %s", docker, sandboxIP,
+			))
+			if c != 0 || strings.Contains(out, "100% packet loss") {
+				msgs = append(msgs, "sidecar cannot reach sandbox — same-bridge traffic blocked")
+			}
+		}
+
+		// Sandbox must be able to reach sidecar (reverse direction)
+		if len(msgs) == 0 {
+			out, _, c := run(client, fmt.Sprintf(
+				"sudo %s exec sandbox ping -c2 -W3 %s", docker, sidecarIP,
+			))
+			if c != 0 || strings.Contains(out, "100% packet loss") {
+				msgs = append(msgs, "sandbox cannot reach sidecar — same-bridge traffic blocked")
+			}
+		}
+
+		// Clean up
+		run(client, fmt.Sprintf("sudo %s rm -f sidecar sandbox 2>/dev/null", docker))
+		run(client, fmt.Sprintf("sudo %s network rm %s 2>/dev/null; true", docker, sidecarNet))
+
+		d := time.Since(start)
+		if len(msgs) == 0 {
+			pass(33, "isolation.d: sidecar pattern — same-bridge non-whitelisted peers communicate (T11)", d)
+		} else {
+			fail(33, "isolation.d: sidecar pattern", strings.Join(msgs, " | "), d)
+			isoOK = false
+		}
+	}
+
+	// 34 — T5: isolation chain cleaned up on stop, recreated on start
 	if isoOK {
 		start := time.Now()
 		var msgs []string
@@ -1346,14 +1432,14 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 
 		d := time.Since(start)
 		if len(msgs) == 0 {
-			pass(33, "isolation.d: chain cleaned up on stop, recreated on start (T5)", d)
+			pass(34, "isolation.d: chain cleaned up on stop, recreated on start (T5)", d)
 		} else {
-			fail(33, "isolation.d: stop/start chain lifecycle", strings.Join(msgs, " | "), d)
+			fail(34, "isolation.d: stop/start chain lifecycle", strings.Join(msgs, " | "), d)
 			isoOK = false
 		}
 	}
 
-	// 34 — T6: multiple rules files merged
+	// 35 — T6: multiple rules files merged
 	if isoOK {
 		start := time.Now()
 		var msgs []string
@@ -1395,13 +1481,13 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 
 		d := time.Since(start)
 		if len(msgs) == 0 {
-			pass(34, "isolation.d: multiple rules files merged (T6)", d)
+			pass(35, "isolation.d: multiple rules files merged (T6)", d)
 		} else {
-			fail(34, "isolation.d: multiple rules files", strings.Join(msgs, " | "), d)
+			fail(35, "isolation.d: multiple rules files", strings.Join(msgs, " | "), d)
 		}
 	}
 
-	// 35 — T7: comments and blank lines in rules files ignored
+	// 36 — T7: comments and blank lines in rules files ignored
 	if isoOK {
 		start := time.Now()
 		var msgs []string
@@ -1460,13 +1546,13 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 
 		d := time.Since(start)
 		if len(msgs) == 0 {
-			pass(35, "isolation.d: comments and blank lines ignored (T7)", d)
+			pass(36, "isolation.d: comments and blank lines ignored (T7)", d)
 		} else {
-			fail(35, "isolation.d: comment parsing", strings.Join(msgs, " | "), d)
+			fail(36, "isolation.d: comment parsing", strings.Join(msgs, " | "), d)
 		}
 	}
 
-	// 36 — T8: cross-instance isolation preserved with isolation.d
+	// 37 — T8: cross-instance isolation preserved with isolation.d
 	//
 	// With isolation.d enabled on A, verify A's containers are not visible
 	// via the system docker (if installed) or any other Docker socket.
@@ -1516,13 +1602,13 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 
 		d := time.Since(start)
 		if len(msgs) == 0 {
-			pass(36, "isolation.d: daemon isolation preserved (T8)", d)
+			pass(37, "isolation.d: daemon isolation preserved (T8)", d)
 		} else {
-			fail(36, "isolation.d: cross-instance isolation", strings.Join(msgs, " | "), d)
+			fail(37, "isolation.d: cross-instance isolation", strings.Join(msgs, " | "), d)
 		}
 	}
 
-	// 37 — T9: destroy cleans up isolation chain and rules directory
+	// 38 — T9: destroy cleans up isolation chain and rules directory
 	if isoOK {
 		start := time.Now()
 		var msgs []string
@@ -1555,13 +1641,13 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 
 		d := time.Since(start)
 		if len(msgs) == 0 {
-			pass(37, "isolation.d: destroy cleans up chain and rules dir (T9)", d)
+			pass(38, "isolation.d: destroy cleans up chain and rules dir (T9)", d)
 		} else {
-			fail(37, "isolation.d: destroy cleanup", strings.Join(msgs, " | "), d)
+			fail(38, "isolation.d: destroy cleanup", strings.Join(msgs, " | "), d)
 		}
 	}
 
-	// 38 — T10: isolation survives reboot
+	// 39 — T10: isolation survives reboot
 	//
 	// Re-create instance A with isolation rules, reboot the host, verify
 	// the chain is automatically recreated by the systemd service.
@@ -1661,9 +1747,9 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 
 		d := time.Since(start)
 		if len(msgs) == 0 {
-			pass(38, "isolation.d: chain survives reboot (T10)", d)
+			pass(39, "isolation.d: chain survives reboot (T10)", d)
 		} else {
-			fail(38, "isolation.d: reboot persistence", strings.Join(msgs, " | "), d)
+			fail(39, "isolation.d: reboot persistence", strings.Join(msgs, " | "), d)
 		}
 	}
 
@@ -1693,7 +1779,7 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 			btrfsImg, btrfsImg, btrfsMnt, btrfsImg, btrfsMnt,
 		))
 		if code != 0 {
-			fmt.Printf("[SKIP] BTRFS setup failed: %s — skipping tests 39-41\n", strings.TrimSpace(se))
+			fmt.Printf("[SKIP] BTRFS setup failed: %s — skipping tests 40-42\n", strings.TrimSpace(se))
 			btrfsOK = false
 		}
 	}
@@ -1712,9 +1798,9 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		))
 		d := time.Since(start)
 		if code == 0 && strings.Contains(out, "btrfs-runc-ok") {
-			pass(39, "BTRFS bind mount with runc (baseline)", d)
+			pass(40, "BTRFS bind mount with runc (baseline)", d)
 		} else {
-			fail(39, "BTRFS bind mount with runc (baseline)", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
+			fail(40, "BTRFS bind mount with runc (baseline)", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
 			btrfsOK = false
 		}
 		run(client, fmt.Sprintf("sudo rm -rf %s", testDir))
@@ -1737,9 +1823,9 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		))
 		d := time.Since(start)
 		if code == 0 && strings.Contains(out, "btrfs-sysbox-ok") {
-			pass(40, "BTRFS bind mount with sysbox (chmod+touch on mountpoint)", d)
+			pass(41, "BTRFS bind mount with sysbox (chmod+touch on mountpoint)", d)
 		} else {
-			fail(40, "BTRFS bind mount with sysbox (chmod+touch on mountpoint)", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
+			fail(41, "BTRFS bind mount with sysbox (chmod+touch on mountpoint)", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
 		}
 		run(client, fmt.Sprintf("sudo rm -rf %s", testDir))
 	}
@@ -1760,9 +1846,9 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		))
 		d := time.Since(start)
 		if code == 0 && strings.Contains(out, "btrfs-subvol-ok") {
-			pass(41, "BTRFS subvolume bind mount with sysbox", d)
+			pass(42, "BTRFS subvolume bind mount with sysbox", d)
 		} else {
-			fail(41, "BTRFS subvolume bind mount with sysbox", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
+			fail(42, "BTRFS subvolume bind mount with sysbox", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
 		}
 
 		// Clean up: delete subvolume (or dir fallback), then unmount + remove image
@@ -1898,9 +1984,9 @@ func runBtrfsOnly(client *ssh.Client) {
 		))
 		d := time.Since(start)
 		if code == 0 && strings.Contains(out, "btrfs-runc-ok") {
-			pass(39, "BTRFS bind mount with runc (baseline)", d)
+			pass(40, "BTRFS bind mount with runc (baseline)", d)
 		} else {
-			fail(39, "BTRFS bind mount with runc (baseline)", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
+			fail(40, "BTRFS bind mount with runc (baseline)", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
 		}
 		run(client, fmt.Sprintf("sudo rm -rf %s", testDir))
 	}
@@ -1918,9 +2004,9 @@ func runBtrfsOnly(client *ssh.Client) {
 		))
 		d := time.Since(start)
 		if code == 0 && strings.Contains(out, "btrfs-sysbox-ok") {
-			pass(40, "BTRFS bind mount with sysbox (chmod+touch on mountpoint)", d)
+			pass(41, "BTRFS bind mount with sysbox (chmod+touch on mountpoint)", d)
 		} else {
-			fail(40, "BTRFS bind mount with sysbox (chmod+touch on mountpoint)", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
+			fail(41, "BTRFS bind mount with sysbox (chmod+touch on mountpoint)", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
 		}
 		run(client, fmt.Sprintf("sudo rm -rf %s", testDir))
 	}
@@ -1939,9 +2025,9 @@ func runBtrfsOnly(client *ssh.Client) {
 		))
 		d := time.Since(start)
 		if code == 0 && strings.Contains(out, "btrfs-subvol-ok") {
-			pass(41, "BTRFS subvolume bind mount with sysbox", d)
+			pass(42, "BTRFS subvolume bind mount with sysbox", d)
 		} else {
-			fail(41, "BTRFS subvolume bind mount with sysbox", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
+			fail(42, "BTRFS subvolume bind mount with sysbox", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
 		}
 		run(client, fmt.Sprintf("sudo btrfs subvolume delete %s 2>/dev/null; sudo rm -rf %s 2>/dev/null; true", subvol, subvol))
 	}

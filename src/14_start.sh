@@ -124,6 +124,9 @@ cmd_start() {
 
     # Apply isolation rules from ${ETC_DIR}/isolation.d/ if any .rules files exist.
     # Each .rules file lists IPs to ACCEPT; all other intra-bridge traffic is DROPped.
+    # Containers on the same bridge subnet are always allowed to communicate —
+    # isolation controls which external/infrastructure IPs are reachable, not
+    # intra-bridge traffic between co-located containers.
     local isolation_dir="${ETC_DIR}/isolation.d"
     local iso_chain="DOCKYARD-ISO-${DOCKYARD_DOCKER_PREFIX%_}"
     if ls "${isolation_dir}"/*.rules >/dev/null 2>&1; then
@@ -141,6 +144,22 @@ cmd_start() {
                 iptables -A "$iso_chain" -d "$line" -j ACCEPT
             done < "$f"
         done
+
+        # Allow intra-bridge traffic: containers on the same bridge should
+        # always be able to communicate. Auto-whitelist each bridge's subnet.
+        for net_id in $("${BIN_DIR}/docker-cli" -H "unix://${DOCKER_SOCKET}" network ls \
+                --filter driver=bridge --format '{{.ID}}' 2>/dev/null); do
+            local br="br-${net_id:0:12}"
+            ip link show "$br" &>/dev/null || continue
+            local br_cidr
+            br_cidr=$(ip -4 -o addr show "$br" 2>/dev/null | awk '{print $4}')
+            if [ -n "$br_cidr" ]; then
+                iptables -A "$iso_chain" -s "$br_cidr" -j ACCEPT
+                iptables -A "$iso_chain" -d "$br_cidr" -j ACCEPT
+                echo "  bridge subnet ${br_cidr} whitelisted on ${br}"
+            fi
+        done
+
         iptables -A "$iso_chain" -j DROP
 
         # Add per-bridge jump rules for this instance's user-defined networks
