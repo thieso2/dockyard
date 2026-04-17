@@ -261,6 +261,25 @@ DOCKEREOF
     echo "  storage:     ${STORAGE_DRIVER} (on ${BACKING_FS})"
     echo ""
 
+    # Detect host upstream DNS so containers don't fall back to Docker's
+    # hardcoded 8.8.8.8 when /etc/resolv.conf points at systemd-resolved.
+    # See https://github.com/thieso2/dockyard/issues/19.
+    local DNS_JSON="" dns_list dns_ip dns_joined=""
+    dns_list=$(detect_upstream_dns)
+    if [ -n "$dns_list" ]; then
+        for dns_ip in $dns_list; do
+            if [ -z "$dns_joined" ]; then
+                dns_joined="\"${dns_ip}\""
+            else
+                dns_joined="${dns_joined},\"${dns_ip}\""
+            fi
+        done
+        DNS_JSON="  \"dns\": [${dns_joined}],"$'\n'
+        echo "  dns:         ${dns_list}"
+    else
+        echo "  dns:         (none detected — Docker will use built-in fallback)"
+    fi
+
     # Write daemon.json (embedded — no external file dependency)
     # sysbox-runc 0.6.7.9-tc parses --run-dir from os.Args in init(), so
     # runtimeArgs works correctly. No wrapper script needed.
@@ -275,7 +294,7 @@ DOCKEREOF
   },
   "storage-driver": "${STORAGE_DRIVER}",
   "userland-proxy-path": "${BIN_DIR}/docker-proxy",
-  "features": {
+${DNS_JSON}  "features": {
     "buildkit": true
   }
 }

@@ -23,31 +23,114 @@ The `dockyard.sh` at the repo root is the working copy (not a symlink). `dist/do
 
 ## Running the Integration Tests
 
-The test suite (`cmd/dockyardtest/main.go`) SSHes into a remote Linux VM and runs 29 end-to-end tests across 3 dockyard instances.
+The test suite (`cmd/dockyardtest/main.go`) SSHes into a remote Linux VM and runs 43 end-to-end tests across 3 dockyard instances. The only flags are `--host`, `--port`, `--user`, `--key`, `--timeout`, and `--only` (values: `""` for full suite, `btrfs` for BTRFS-only). There is no name-based filter.
 
 ```bash
 # Run against a test VM (uploads dist/dockyard.sh automatically)
-./dockyardtest_mac --host HOST --user thies [--key /path/to/key] [--port PORT]
+./dockyardtest_linux --host HOST --user USER [--key /path/to/key] [--port PORT]
 
-# Sandcastle iso-test VM (via Tailscale)
-./cmd/dockyardtest/dockyardtest_mac --host 100.106.185.92 --user thies --port 2223
+# Sandman incus dockyard-test VM (via Tailscale, DNAT 2223 → VM:22)
+./cmd/dockyardtest/dockyardtest_linux --host 100.100.218.64 --user thies --port 2223
 
-# Run a specific test by name (substring match on test subject)
-./dockyardtest_mac --host HOST --user thies --run "verify"
+# BTRFS-only subset
+./dockyardtest_linux --host HOST --user USER --only btrfs
 ```
 
-### Test VM Setup (Sandcastle)
+### Test VM Setup (sandman, incus)
 
-The `iso-test` VM on sandcastle (100.106.185.92) runs the full 38-test suite:
-- Incus VM: `incus launch images:ubuntu/noble iso-test --vm -c limits.cpu=4 -c limits.memory=8GiB -d root,size=50GiB`
-- Static IP: 10.50.0.20/24 via netplan on enp5s0, gateway 10.50.0.1
-- SSH: port-forwarded from host :2223 → VM :22
-- DNS: systemd-resolved with 1.1.1.1/8.8.8.8
-- Host iptables: FORWARD rules for incusbr0 + NAT MASQUERADE for 10.50.0.0/24
-- Prereqs: `openssh-server iptables rsync fuse3 iproute2 jq curl`
-- Alpine cache: `/var/tmp/alpine.tar` (bootstrapped via a temporary dockyard instance)
+The `dockyard-test` VM on sandman (100.100.218.64) runs the full 43-test suite. This is the primary test target; the old sandcastle `iso-test` VM at 100.106.185.92 is not maintained.
 
-See MEMORY.md for full infrastructure details.
+One-shot setup from your dev machine (everything after the `ssh` runs on sandman):
+
+```bash
+# 1. Cloud-init user-data: create `thies` with your pubkey, preinstall prereqs
+MY_KEY=$(ssh-add -L | head -1)
+ssh 100.100.218.64 "cat > /tmp/dockyard-cloud-init.yaml" <<EOF
+#cloud-config
+users:
+  - name: thies
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    groups: [sudo]
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${MY_KEY}
+ssh_pwauth: false
+package_update: true
+packages:
+  - openssh-server
+  - iptables
+  - rsync
+  - fuse3
+  - iproute2
+  - jq
+  - curl
+  - btrfs-progs
+EOF
+
+# 2. Launch the VM (uses incusbr0, DHCP)
+ssh 100.100.218.64 'incus launch images:ubuntu/noble/cloud dockyard-test --vm \
+    -c limits.cpu=4 -c limits.memory=8GiB \
+    -d root,size=50GiB \
+    -c user.user-data="$(cat /tmp/dockyard-cloud-init.yaml)"'
+
+# 3. Wait for cloud-init to finish (ssh + apt install takes ~3–5 min on first run)
+ssh 100.100.218.64 'incus exec dockyard-test -- cloud-init status --wait'
+
+# 4. Unlock the `thies` account — cloud-init locks passwordless accounts by
+#    default, and sshd refuses them even for pubkey auth. Set any password;
+#    sshd then accepts pubkey logins.
+ssh 100.100.218.64 'incus exec dockyard-test -- bash -c \
+  "echo thies:\$(openssl rand -base64 20) | chpasswd"'
+
+# 5. Find the VM IP and install host DNAT rules for SSH.
+#    Incus proxy devices can not listen on 0.0.0.0 for VMs, so we NAT manually.
+VM_IP=$(ssh 100.100.218.64 "incus list dockyard-test -c 4 --format csv" | awk '{print $1}')
+ssh 100.100.218.64 "sudo iptables -t nat -C PREROUTING -p tcp --dport 2223 -j DNAT --to-destination ${VM_IP}:22 2>/dev/null || \
+  sudo iptables -t nat -I PREROUTING -p tcp --dport 2223 -j DNAT --to-destination ${VM_IP}:22
+  sudo iptables -C FORWARD -p tcp -d ${VM_IP} --dport 22 -j ACCEPT 2>/dev/null || \
+  sudo iptables -I FORWARD -p tcp -d ${VM_IP} --dport 22 -j ACCEPT"
+
+# 6. Verify SSH
+ssh -p 2223 thies@100.100.218.64 'uname -a; which iptables rsync jq curl btrfs fusermount3'
+```
+
+### Running the tests
+
+```bash
+# Build the Linux test binary (needs mise-managed Go 1.26)
+mise install
+GOOS=linux GOARCH=amd64 go build -o cmd/dockyardtest/dockyardtest_linux ./cmd/dockyardtest/
+
+# Build dockyard.sh
+./build.sh
+
+# Full suite (~20 min)
+./cmd/dockyardtest/dockyardtest_linux --host 100.100.218.64 --user thies --port 2223
+```
+
+### Resetting the VM between runs
+
+The suite cleans up after itself, but if it crashes mid-run:
+
+```bash
+ssh -p 2223 thies@100.100.218.64 '
+  for p in dy1_ dy2_ dy3_; do
+    sudo systemctl stop ${p}docker 2>/dev/null
+    sudo rm -f /etc/systemd/system/${p}docker.service
+    sudo rm -rf /${p%_} 2>/dev/null
+    sudo userdel ${p}docker 2>/dev/null
+  done
+  sudo systemctl daemon-reload
+'
+```
+
+### DNS scenario notes
+
+`dockyard-test` uses `incusbr0`'s dnsmasq as its upstream DNS (10.146.154.1) and `/etc/resolv.conf` points at 127.0.0.53 (systemd-resolved). This reproduces the host shape described in issue #19, so test 10 (`daemon.json embeds host upstream DNS`) exercises the real `detect_upstream_dns()` path.
+
+### Why DNAT instead of `incus proxy`
+
+Incus proxy devices on VM instances require NAT mode, and NAT mode refuses `listen=tcp:0.0.0.0` *and* requires the target VM to have a statically-configured IP. The VM here uses DHCP, so we bypass the incus proxy entirely and install a manual iptables DNAT rule on sandman. The rule persists across VM reboots; it only needs re-adding if sandman itself reboots or the VM's DHCP lease hands out a different IP.
 
 ## Key Commands
 

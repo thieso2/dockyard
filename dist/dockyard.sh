@@ -186,6 +186,52 @@ detect_storage_driver() {
     echo "overlay2"
 }
 
+# Detect the host's upstream DNS resolvers for embedding into daemon.json.
+# Fixes https://github.com/thieso2/dockyard/issues/19: on hosts where
+# /etc/resolv.conf points at 127.0.0.53 (systemd-resolved), Docker detects
+# loopback-only resolvers and falls back to hardcoded 8.8.8.8 / 8.8.4.4.
+# Environments that block public DNS (e.g. Hetzner) then see silent DNS
+# failure inside containers.
+#
+# Lookup order:
+#   1. DOCKYARD_DNS env override (space- or comma-separated IPs)
+#   2. resolvectl dns (systemd-resolved authoritative source)
+#   3. /run/systemd/resolve/resolv.conf (real upstreams when resolved is used)
+#   4. /etc/resolv.conf (whatever is there, loopback filtered out)
+#
+# Loopback (127.0.0.0/8) and link-local (169.254.0.0/16) entries are stripped.
+# Returns a space-separated list on stdout, or empty string when nothing is
+# available (caller then omits the "dns" key from daemon.json so Docker uses
+# its own defaults).
+detect_upstream_dns() {
+    local raw=""
+
+    if [ -n "${DOCKYARD_DNS:-}" ]; then
+        raw="${DOCKYARD_DNS//,/ }"
+    elif command -v resolvectl &>/dev/null; then
+        # resolvectl dns prints "Global: 1.1.1.1 8.8.8.8" and per-link lines.
+        # Extract every IP-shaped token from all lines.
+        raw=$(resolvectl dns 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u | tr '\n' ' ')
+    fi
+
+    if [ -z "$raw" ] && [ -f /run/systemd/resolve/resolv.conf ]; then
+        raw=$(awk '/^nameserver/ {print $2}' /run/systemd/resolve/resolv.conf | tr '\n' ' ')
+    fi
+
+    if [ -z "$raw" ] && [ -f /etc/resolv.conf ]; then
+        raw=$(awk '/^nameserver/ {print $2}' /etc/resolv.conf | tr '\n' ' ')
+    fi
+
+    local ip out=""
+    for ip in $raw; do
+        case "$ip" in
+            127.*|169.254.*|::1|fe80:*) continue ;;
+        esac
+        out="${out}${ip} "
+    done
+    echo "${out% }"
+}
+
 wait_for_file() {
     local file="$1"
     local label="$2"
@@ -697,6 +743,25 @@ DOCKEREOF
     echo "  storage:     ${STORAGE_DRIVER} (on ${BACKING_FS})"
     echo ""
 
+    # Detect host upstream DNS so containers don't fall back to Docker's
+    # hardcoded 8.8.8.8 when /etc/resolv.conf points at systemd-resolved.
+    # See https://github.com/thieso2/dockyard/issues/19.
+    local DNS_JSON="" dns_list dns_ip dns_joined=""
+    dns_list=$(detect_upstream_dns)
+    if [ -n "$dns_list" ]; then
+        for dns_ip in $dns_list; do
+            if [ -z "$dns_joined" ]; then
+                dns_joined="\"${dns_ip}\""
+            else
+                dns_joined="${dns_joined},\"${dns_ip}\""
+            fi
+        done
+        DNS_JSON="  \"dns\": [${dns_joined}],"$'\n'
+        echo "  dns:         ${dns_list}"
+    else
+        echo "  dns:         (none detected — Docker will use built-in fallback)"
+    fi
+
     # Write daemon.json (embedded — no external file dependency)
     # sysbox-runc 0.6.7.9-tc parses --run-dir from os.Args in init(), so
     # runtimeArgs works correctly. No wrapper script needed.
@@ -711,7 +776,7 @@ DOCKEREOF
   },
   "storage-driver": "${STORAGE_DRIVER}",
   "userland-proxy-path": "${BIN_DIR}/docker-proxy",
-  "features": {
+${DNS_JSON}  "features": {
     "buildkit": true
   }
 }

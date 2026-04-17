@@ -256,13 +256,13 @@ func cleanupAllInstances(client *ssh.Client) {
 		run(client, fmt.Sprintf("sudo rm -f /etc/systemd/system/%sdocker.service 2>/dev/null; true", inst.Prefix))
 		run(client, fmt.Sprintf("rm -f %s 2>/dev/null; true", inst.EnvFile))
 	}
-	// Clean up nested-root test instance (test 30)
+	// Clean up nested-root test instance (test 31)
 	run(client, "[ -f ~/dockyard-nested-test/dyn.env ] && sudo env DOCKYARD_ENV=~/dockyard-nested-test/dyn.env ~/dockyard.sh destroy --yes 2>/dev/null; true")
 	run(client, "sudo rm -rf /var/tmp/dockyard-nested 2>/dev/null; true")
 	run(client, "sudo systemctl stop dyn_docker 2>/dev/null; sudo systemctl disable dyn_docker 2>/dev/null; true")
 	run(client, "sudo rm -f /etc/systemd/system/dyn_docker.service 2>/dev/null; true")
 	run(client, "rm -rf ~/dockyard-nested-test 2>/dev/null; true")
-	// Clean up BTRFS loopback from tests 40-42
+	// Clean up BTRFS loopback from tests 41-43
 	run(client, "sudo umount /var/tmp/btrfs-mount 2>/dev/null; true")
 	run(client, "sudo rm -rf /var/tmp/btrfs-mount /var/tmp/btrfs-test.img 2>/dev/null; true")
 	run(client, "sudo systemctl daemon-reload 2>/dev/null; true")
@@ -434,6 +434,57 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		}
 	}
 
+	// 10 — daemon.json embeds host upstream DNS (issue #19)
+	//
+	// On hosts where /etc/resolv.conf points at 127.0.0.53 (systemd-resolved),
+	// Docker's own heuristic usually finds the real upstream via
+	// /run/systemd/resolve/resolv.conf — but the heuristic is fragile:
+	// on networks that block 8.8.8.8 (e.g. Hetzner) any corner case where
+	// Docker falls back to its hardcoded public-DNS default makes container
+	// DNS silently break.
+	//
+	// dockyard must sidestep the heuristic by detecting the host's upstream
+	// at install time and writing it into daemon.json's "dns" field. This
+	// test checks that the config is in place and that it matches what
+	// systemd-resolved reports. Without the fix, daemon.json has no "dns"
+	// field and this test fails.
+	//
+	// Skipped on hosts that don't use systemd-resolved (no 127.0.0.53 in
+	// /etc/resolv.conf) — the fix is a no-op there, nothing to assert.
+	{
+		start := time.Now()
+		resolvConf, _, _ := run(client, "cat /etc/resolv.conf 2>/dev/null")
+		if !strings.Contains(resolvConf, "127.0.0.53") {
+			pass(10, "daemon.json embeds host upstream DNS (issue #19) — skipped, host not using systemd-resolved", time.Since(start))
+		} else {
+			// Collect host's upstream DNS from systemd-resolved's real resolv.conf
+			// (same source the fix uses) so we can cross-check what ends up in
+			// daemon.json.
+			upstream, _, _ := run(client, "awk '/^nameserver/ {print $2}' /run/systemd/resolve/resolv.conf 2>/dev/null | grep -v '^127\\.' | grep -v ':' | head -1")
+			upstream = strings.TrimSpace(upstream)
+
+			rs = forAll(client, allInstances, func(c *ssh.Client, inst Instance) (bool, string) {
+				out, se, code := run(c, fmt.Sprintf("sudo cat %s/etc/daemon.json", inst.Root))
+				if code != 0 {
+					return false, "cannot read daemon.json: " + se
+				}
+				if !strings.Contains(out, "\"dns\"") {
+					return false, "daemon.json has no \"dns\" field — Docker will fall back to 8.8.8.8 on broken environments"
+				}
+				if upstream != "" && !strings.Contains(out, upstream) {
+					return false, "daemon.json dns field does not contain host upstream " + upstream
+				}
+				return true, ""
+			})
+			d := time.Since(start)
+			if allOK(rs) {
+				pass(10, "daemon.json embeds host upstream DNS (issue #19)", d)
+			} else {
+				fail(10, "daemon.json embeds host upstream DNS (issue #19)", failMsgs(rs), d)
+			}
+		}
+	}
+
 	//
 	// ── Phase 6: Docker-in-Docker ─────────────────────────────────────────────
 	//
@@ -448,7 +499,7 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		return true, ""
 	})
 
-	// 10 — all instances: start DinD container (no --privileged; sysbox handles it)
+	// 11 — all instances: start DinD container (no --privileged; sysbox handles it)
 	{
 		start := time.Now()
 		rs = forAll(client, allInstances, func(c *ssh.Client, inst Instance) (bool, string) {
@@ -475,13 +526,13 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		})
 		d := time.Since(start)
 		if allOK(rs) {
-			pass(10, "all instances: DinD start", d)
+			pass(11, "all instances: DinD start", d)
 		} else {
-			fail(10, "all instances: DinD start", failMsgs(rs), d)
+			fail(11, "all instances: DinD start", failMsgs(rs), d)
 		}
 	}
 
-	// 11 — all instances: DinD inner container
+	// 12 — all instances: DinD inner container
 	{
 		start := time.Now()
 		rs = forAll(client, allInstances, func(c *ssh.Client, inst Instance) (bool, string) {
@@ -497,13 +548,13 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		})
 		d := time.Since(start)
 		if allOK(rs) {
-			pass(11, "all instances: DinD inner container", d)
+			pass(12, "all instances: DinD inner container", d)
 		} else {
-			fail(11, "all instances: DinD inner container", failMsgs(rs), d)
+			fail(12, "all instances: DinD inner container", failMsgs(rs), d)
 		}
 	}
 
-	// 12 — all instances: DinD inner networking
+	// 13 — all instances: DinD inner networking
 	{
 		start := time.Now()
 		rs = forAll(client, allInstances, func(c *ssh.Client, inst Instance) (bool, string) {
@@ -519,9 +570,9 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		})
 		d := time.Since(start)
 		if allOK(rs) {
-			pass(12, "all instances: DinD inner networking", d)
+			pass(13, "all instances: DinD inner networking", d)
 		} else {
-			fail(12, "all instances: DinD inner networking", failMsgs(rs), d)
+			fail(13, "all instances: DinD inner networking", failMsgs(rs), d)
 		}
 	}
 
@@ -529,15 +580,15 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 	// ── Phase 7: Multi-instance isolation ────────────────────────────────────
 	//
 
-	// 13 — all pairs isolated: A↔B, A↔C, B↔C
+	// 14 — all pairs isolated: A↔B, A↔C, B↔C
 	{
 		start := time.Now()
 		isolationFails := checkIsolation(client, allInstances)
 		d := time.Since(start)
 		if len(isolationFails) == 0 {
-			pass(13, "multi-instance isolation (all pairs)", d)
+			pass(14, "multi-instance isolation (all pairs)", d)
 		} else {
-			fail(13, "multi-instance isolation", strings.Join(isolationFails, " | "), d)
+			fail(14, "multi-instance isolation", strings.Join(isolationFails, " | "), d)
 		}
 	}
 
@@ -552,7 +603,7 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 	// ── Phase 8: Verify subcommand ────────────────────────────────────────────
 	//
 
-	// 14 — all instances: verify subcommand passes end-to-end (concurrent)
+	// 15 — all instances: verify subcommand passes end-to-end (concurrent)
 	// Runs dockyard.sh verify on each instance; internally exercises service,
 	// socket, docker info, container run, outbound networking, and DinD.
 	{
@@ -571,9 +622,9 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		})
 		d := time.Since(start)
 		if allOK(rs) {
-			pass(14, "all instances: verify passes (6/6 checks)", d)
+			pass(15, "all instances: verify passes (6/6 checks)", d)
 		} else {
-			fail(14, "all instances: verify", failMsgs(rs), d)
+			fail(15, "all instances: verify", failMsgs(rs), d)
 		}
 	}
 
@@ -581,37 +632,37 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 	// ── Phase 9: Edge-case tests ──────────────────────────────────────────────
 	//
 
-	// 15 — stop/start cycle on instance A
+	// 16 — stop/start cycle on instance A
 	// Validates ExecStartPre/ExecStopPost iptables lifecycle and clean daemon restart.
 	{
 		start := time.Now()
 		inst := allInstances[0]
 		_, se, code := run(client, "sudo systemctl stop "+inst.Prefix+"docker")
 		if code != 0 {
-			fail(15, "stop/start cycle", "stop failed: "+se, time.Since(start))
+			fail(16, "stop/start cycle", "stop failed: "+se, time.Since(start))
 		} else {
 			_, _, isActive := run(client, "systemctl is-active "+inst.Prefix+"docker")
 			if isActive == 0 {
-				fail(15, "stop/start cycle", "service still active after stop", time.Since(start))
+				fail(16, "stop/start cycle", "service still active after stop", time.Since(start))
 			} else {
 				_, se2, c2 := run(client, "sudo systemctl start "+inst.Prefix+"docker")
 				if c2 != 0 {
-					fail(15, "stop/start cycle", "start failed: "+se2, time.Since(start))
+					fail(16, "stop/start cycle", "start failed: "+se2, time.Since(start))
 				} else {
 					out, se3, c3 := run(client, fmt.Sprintf(
 						"sudo %s run --rm alpine echo cycled", inst.Docker,
 					))
 					if c3 != 0 || !strings.Contains(out, "cycled") {
-						fail(15, "stop/start cycle", "container after restart: "+se3, time.Since(start))
+						fail(16, "stop/start cycle", "container after restart: "+se3, time.Since(start))
 					} else {
-						pass(15, "stop/start cycle (stop → start → container run)", time.Since(start))
+						pass(16, "stop/start cycle (stop → start → container run)", time.Since(start))
 					}
 				}
 			}
 		}
 	}
 
-	// 16 — socket permissions: not world-accessible + owned by instance group
+	// 17 — socket permissions: not world-accessible + owned by instance group
 	// The docker socket must never be world-accessible, and must be owned by the
 	// per-instance group (${PREFIX}docker) so group members can access it without sudo.
 	{
@@ -639,13 +690,13 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		})
 		d := time.Since(start)
 		if allOK(rs) {
-			pass(16, "socket permissions (not world-accessible, group-owned by instance)", d)
+			pass(17, "socket permissions (not world-accessible, group-owned by instance)", d)
 		} else {
-			fail(16, "socket permissions", failMsgs(rs), d)
+			fail(17, "socket permissions", failMsgs(rs), d)
 		}
 	}
 
-	// 17 — sysbox bind-mount: mkdir inside non-root-owned 777 dir
+	// 18 — sysbox bind-mount: mkdir inside non-root-owned 777 dir
 	// On kernel 6.17+, sysbox user-namespace containers cannot create entries
 	// inside bind-mounted directories owned by UIDs outside the container's
 	// mapping, even with 777 permissions. This test catches that regression.
@@ -675,14 +726,14 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 			))
 			if code != 0 || !strings.Contains(out, "mkdir-ok") {
 				run(client, fmt.Sprintf("sudo rm -rf %s", testDir))
-				fail(17, "sysbox bind-mount mkdir", "mkdir fails even with root-owned dir: "+se, time.Since(start))
+				fail(18, "sysbox bind-mount mkdir", "mkdir fails even with root-owned dir: "+se, time.Since(start))
 			} else {
 				run(client, fmt.Sprintf("sudo rm -rf %s", testDir))
-				pass(17, "sysbox bind-mount mkdir (non-root-owned 777 dirs need chown 0:0 workaround)", time.Since(start))
+				pass(18, "sysbox bind-mount mkdir (non-root-owned 777 dirs need chown 0:0 workaround)", time.Since(start))
 			}
 		} else {
 			run(client, fmt.Sprintf("sudo rm -rf %s", testDir))
-			pass(17, "sysbox bind-mount mkdir (non-root-owned 777 dir works natively)", time.Since(start))
+			pass(18, "sysbox bind-mount mkdir (non-root-owned 777 dir works natively)", time.Since(start))
 		}
 	}
 
@@ -690,7 +741,7 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 	// ── Phase 10: Destroy instance A, verify B+C unaffected ──────────────────
 	//
 
-	// 18 — destroy A under load (running container must not block destroy)
+	// 19 — destroy A under load (running container must not block destroy)
 	{
 		start := time.Now()
 		inst := allInstances[0]
@@ -701,13 +752,13 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		_, se, code := run(client, fmt.Sprintf("sudo env DOCKYARD_ENV=%s ~/dockyard.sh destroy --yes", inst.EnvFile))
 		d := time.Since(start)
 		if code != 0 {
-			fail(18, "destroy under load", se, d)
+			fail(19, "destroy under load", se, d)
 		} else {
-			pass(18, "destroy under load (running container present at destroy time)", d)
+			pass(19, "destroy under load (running container present at destroy time)", d)
 		}
 	}
 
-	// 19 — double destroy idempotency (A already gone, second call must succeed)
+	// 20 — double destroy idempotency (A already gone, second call must succeed)
 	{
 		start := time.Now()
 		_, se, code := run(client, fmt.Sprintf(
@@ -715,13 +766,13 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		))
 		d := time.Since(start)
 		if code != 0 {
-			fail(19, "double destroy idempotency", se, d)
+			fail(20, "double destroy idempotency", se, d)
 		} else {
-			pass(19, "double destroy idempotency (second destroy is a no-op)", d)
+			pass(20, "double destroy idempotency (second destroy is a no-op)", d)
 		}
 	}
 
-	// 20 — A: service gone, bridge gone, iptables clean
+	// 21 — A: service gone, bridge gone, iptables clean
 	{
 		start := time.Now()
 		aClean := true
@@ -744,13 +795,13 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		}
 		d := time.Since(start)
 		if aClean {
-			pass(20, "A: fully cleaned up (service+bridge+iptables)", d)
+			pass(21, "A: fully cleaned up (service+bridge+iptables)", d)
 		} else {
-			fail(20, "A: fully cleaned up", strings.Join(aCleanMsgs, ", "), d)
+			fail(21, "A: fully cleaned up", strings.Join(aCleanMsgs, ", "), d)
 		}
 	}
 
-	// 21 — B+C: still healthy after A destroy (container + ping)
+	// 22 — B+C: still healthy after A destroy (container + ping)
 	surviving := allInstances[1:]
 	{
 		start := time.Now()
@@ -763,9 +814,9 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		})
 		d := time.Since(start)
 		if allOK(rs) {
-			pass(21, "B+C: still healthy after A destroy", d)
+			pass(22, "B+C: still healthy after A destroy", d)
 		} else {
-			fail(21, "B+C: still healthy after A destroy", failMsgs(rs), d)
+			fail(22, "B+C: still healthy after A destroy", failMsgs(rs), d)
 		}
 	}
 
@@ -773,7 +824,7 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 	// ── Phase 11: Reboot — all surviving instances must come back ─────────────
 	//
 
-	// 22 — reboot
+	// 23 — reboot
 	{
 		start := time.Now()
 		fmt.Println("[INFO] Rebooting host...")
@@ -783,7 +834,7 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 
 		fmt.Println("[INFO] Waiting for SSH (up to 4min)...")
 		if err := waitForSSH(host, port, 4*time.Minute); err != nil {
-			fail(22, "reboot", err.Error(), time.Since(start))
+			fail(23, "reboot", err.Error(), time.Since(start))
 			return
 		}
 		// Give systemd a few seconds to finish starting services
@@ -792,13 +843,13 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		var reconnErr error
 		client, reconnErr = dialSSH(host, port, user, keyPath)
 		if reconnErr != nil {
-			fail(22, "reboot", "could not reconnect: "+reconnErr.Error(), time.Since(start))
+			fail(23, "reboot", "could not reconnect: "+reconnErr.Error(), time.Since(start))
 			return
 		}
-		pass(22, "reboot", time.Since(start))
+		pass(23, "reboot", time.Since(start))
 	}
 
-	// 23 — post-reboot: B+C docker services active (concurrent)
+	// 24 — post-reboot: B+C docker services active (concurrent)
 	// Retry for up to 90s: cold boot on slow hosts means ExecStartPost (API readiness poll)
 	// may still be running when SSH becomes available, causing the service to be in
 	// "activating (start-post)" until docker accepts connections.
@@ -819,13 +870,13 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		})
 		d := time.Since(start)
 		if allOK(rs) {
-			pass(23, "post-reboot: B+C services active", d)
+			pass(24, "post-reboot: B+C services active", d)
 		} else {
-			fail(23, "post-reboot: B+C services active", failMsgs(rs), d)
+			fail(24, "post-reboot: B+C services active", failMsgs(rs), d)
 		}
 	}
 
-	// 24 — post-reboot: B+C containers run (concurrent)
+	// 25 — post-reboot: B+C containers run (concurrent)
 	{
 		start := time.Now()
 		rs = forAll(client, surviving, func(c *ssh.Client, inst Instance) (bool, string) {
@@ -837,13 +888,13 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		})
 		d := time.Since(start)
 		if allOK(rs) {
-			pass(24, "post-reboot: B+C container run", d)
+			pass(25, "post-reboot: B+C container run", d)
 		} else {
-			fail(24, "post-reboot: B+C container run", failMsgs(rs), d)
+			fail(25, "post-reboot: B+C container run", failMsgs(rs), d)
 		}
 	}
 
-	// 25 — post-reboot: B+C outbound networking (concurrent)
+	// 26 — post-reboot: B+C outbound networking (concurrent)
 	{
 		start := time.Now()
 		rs = forAll(client, surviving, func(c *ssh.Client, inst Instance) (bool, string) {
@@ -855,13 +906,13 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		})
 		d := time.Since(start)
 		if allOK(rs) {
-			pass(25, "post-reboot: B+C outbound networking", d)
+			pass(26, "post-reboot: B+C outbound networking", d)
 		} else {
-			fail(25, "post-reboot: B+C outbound networking", failMsgs(rs), d)
+			fail(26, "post-reboot: B+C outbound networking", failMsgs(rs), d)
 		}
 	}
 
-	// 26 — post-reboot: B+C DinD full (start + inner container + inner ping, concurrent)
+	// 27 — post-reboot: B+C DinD full (start + inner container + inner ping, concurrent)
 	{
 		start := time.Now()
 		rs = forAll(client, surviving, func(c *ssh.Client, inst Instance) (bool, string) {
@@ -911,9 +962,9 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		})
 		d := time.Since(start)
 		if allOK(rs) {
-			pass(26, "post-reboot: B+C DinD (start + inner container + inner networking)", d)
+			pass(27, "post-reboot: B+C DinD (start + inner container + inner networking)", d)
 		} else {
-			fail(26, "post-reboot: B+C DinD", failMsgs(rs), d)
+			fail(27, "post-reboot: B+C DinD", failMsgs(rs), d)
 		}
 	}
 
@@ -921,9 +972,9 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 	// ── Phase 12: Destroy remaining instances ─────────────────────────────────
 	//
 
-	// 27-28 — destroy B and C sequentially (avoid systemd race)
+	// 28-29 — destroy B and C sequentially (avoid systemd race)
 	for i, inst := range surviving {
-		num := 27 + i
+		num := 28 + i
 		start := time.Now()
 		_, se, code := run(client, fmt.Sprintf("sudo env DOCKYARD_ENV=%s ~/dockyard.sh destroy --yes", inst.EnvFile))
 		d := time.Since(start)
@@ -934,7 +985,7 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		}
 	}
 
-	// 29 — full cleanup: no services, bridges, iptables rules, data dirs, users
+	// 30 — full cleanup: no services, bridges, iptables rules, data dirs, users
 	{
 		start := time.Now()
 		var cleanFails []string
@@ -984,9 +1035,9 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		}
 		d := time.Since(start)
 		if len(cleanFails) == 0 {
-			pass(29, "full cleanup: no services, bridges, iptables, data dirs, or users", d)
+			pass(30, "full cleanup: no services, bridges, iptables, data dirs, or users", d)
 		} else {
-			fail(29, "full cleanup", strings.Join(cleanFails, " | "), d)
+			fail(30, "full cleanup", strings.Join(cleanFails, " | "), d)
 		}
 	}
 
@@ -994,7 +1045,7 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 	// ── Phase 13: Nested DOCKYARD_ROOT lifecycle ──────────────────────────────
 	//
 
-	// 30 — deeply nested DOCKYARD_ROOT: gen-env → create → container run → destroy
+	// 31 — deeply nested DOCKYARD_ROOT: gen-env → create → container run → destroy
 	// Verifies the FHS layout works when DOCKYARD_ROOT is several levels deep.
 	{
 		start := time.Now()
@@ -1063,9 +1114,9 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 
 		d := time.Since(start)
 		if nestedOK {
-			pass(30, "nested DOCKYARD_ROOT lifecycle (gen-env + create + container run + destroy)", d)
+			pass(31, "nested DOCKYARD_ROOT lifecycle (gen-env + create + container run + destroy)", d)
 		} else {
-			fail(30, "nested DOCKYARD_ROOT lifecycle", nestedMsg, d)
+			fail(31, "nested DOCKYARD_ROOT lifecycle", nestedMsg, d)
 		}
 	}
 
@@ -1092,13 +1143,13 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 			instA.EnvFile, instA.EnvFile, instA.Root, instA.Prefix,
 		))
 		if c != 0 {
-			fail(31, "isolation.d: re-create instance A (gen-env)", se, 0)
+			fail(32, "isolation.d: re-create instance A (gen-env)", se, 0)
 			isoOK = false
 			goto done
 		}
 		_, se, c = run(client, fmt.Sprintf("sudo env DOCKYARD_ENV=%s ~/dockyard.sh create", instA.EnvFile))
 		if c != 0 {
-			fail(31, "isolation.d: re-create instance A (create)", se, 0)
+			fail(32, "isolation.d: re-create instance A (create)", se, 0)
 			isoOK = false
 			goto done
 		}
@@ -1106,7 +1157,7 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		run(client, fmt.Sprintf("sudo %s load < /var/tmp/alpine.tar 2>/dev/null; true", instA.Docker))
 	}
 
-	// 31 — T1+T2: chain created when rules exist, absent otherwise
+	// 32 — T1+T2: chain created when rules exist, absent otherwise
 	if isoOK {
 		start := time.Now()
 		instB := allInstances[1]
@@ -1182,14 +1233,14 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 
 		d := time.Since(start)
 		if len(msgs) == 0 {
-			pass(31, "isolation.d: chain created with rules, absent without (T1+T2)", d)
+			pass(32, "isolation.d: chain created with rules, absent without (T1+T2)", d)
 		} else {
-			fail(31, "isolation.d: chain creation", strings.Join(msgs, " | "), d)
+			fail(32, "isolation.d: chain creation", strings.Join(msgs, " | "), d)
 			isoOK = false
 		}
 	}
 
-	// 32 — T3+T4: allowed IPs pass, non-allowed IPs blocked
+	// 33 — T3+T4: allowed IPs pass, non-allowed IPs blocked
 	//
 	// Strategy: create a user-defined network with a known subnet (--subnet),
 	// assign static IPs to containers, write the infra IP to rules BEFORE
@@ -1291,14 +1342,14 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		// Leave containers and network for subsequent tests
 		d := time.Since(start)
 		if len(msgs) == 0 {
-			pass(32, "isolation.d: allowed IPs pass, same-bridge peers communicate (T3+T4)", d)
+			pass(33, "isolation.d: allowed IPs pass, same-bridge peers communicate (T3+T4)", d)
 		} else {
-			fail(32, "isolation.d: traffic filtering", strings.Join(msgs, " | "), d)
+			fail(33, "isolation.d: traffic filtering", strings.Join(msgs, " | "), d)
 			isoOK = false
 		}
 	}
 
-	// 33 — T11: sidecar pattern — two non-whitelisted containers on a
+	// 34 — T11: sidecar pattern — two non-whitelisted containers on a
 	//          dedicated bridge can communicate (same-bridge auto-whitelist)
 	//
 	// Reproduces the Tailscale sidecar bug: a sidecar and sandbox container
@@ -1377,14 +1428,14 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 
 		d := time.Since(start)
 		if len(msgs) == 0 {
-			pass(33, "isolation.d: sidecar pattern — same-bridge non-whitelisted peers communicate (T11)", d)
+			pass(34, "isolation.d: sidecar pattern — same-bridge non-whitelisted peers communicate (T11)", d)
 		} else {
-			fail(33, "isolation.d: sidecar pattern", strings.Join(msgs, " | "), d)
+			fail(34, "isolation.d: sidecar pattern", strings.Join(msgs, " | "), d)
 			isoOK = false
 		}
 	}
 
-	// 34 — T5: isolation chain cleaned up on stop, recreated on start
+	// 35 — T5: isolation chain cleaned up on stop, recreated on start
 	if isoOK {
 		start := time.Now()
 		var msgs []string
@@ -1432,14 +1483,14 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 
 		d := time.Since(start)
 		if len(msgs) == 0 {
-			pass(34, "isolation.d: chain cleaned up on stop, recreated on start (T5)", d)
+			pass(35, "isolation.d: chain cleaned up on stop, recreated on start (T5)", d)
 		} else {
-			fail(34, "isolation.d: stop/start chain lifecycle", strings.Join(msgs, " | "), d)
+			fail(35, "isolation.d: stop/start chain lifecycle", strings.Join(msgs, " | "), d)
 			isoOK = false
 		}
 	}
 
-	// 35 — T6: multiple rules files merged
+	// 36 — T6: multiple rules files merged
 	if isoOK {
 		start := time.Now()
 		var msgs []string
@@ -1481,13 +1532,13 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 
 		d := time.Since(start)
 		if len(msgs) == 0 {
-			pass(35, "isolation.d: multiple rules files merged (T6)", d)
+			pass(36, "isolation.d: multiple rules files merged (T6)", d)
 		} else {
-			fail(35, "isolation.d: multiple rules files", strings.Join(msgs, " | "), d)
+			fail(36, "isolation.d: multiple rules files", strings.Join(msgs, " | "), d)
 		}
 	}
 
-	// 36 — T7: comments and blank lines in rules files ignored
+	// 37 — T7: comments and blank lines in rules files ignored
 	if isoOK {
 		start := time.Now()
 		var msgs []string
@@ -1546,13 +1597,13 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 
 		d := time.Since(start)
 		if len(msgs) == 0 {
-			pass(36, "isolation.d: comments and blank lines ignored (T7)", d)
+			pass(37, "isolation.d: comments and blank lines ignored (T7)", d)
 		} else {
-			fail(36, "isolation.d: comment parsing", strings.Join(msgs, " | "), d)
+			fail(37, "isolation.d: comment parsing", strings.Join(msgs, " | "), d)
 		}
 	}
 
-	// 37 — T8: cross-instance isolation preserved with isolation.d
+	// 38 — T8: cross-instance isolation preserved with isolation.d
 	//
 	// With isolation.d enabled on A, verify A's containers are not visible
 	// via the system docker (if installed) or any other Docker socket.
@@ -1602,13 +1653,13 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 
 		d := time.Since(start)
 		if len(msgs) == 0 {
-			pass(37, "isolation.d: daemon isolation preserved (T8)", d)
+			pass(38, "isolation.d: daemon isolation preserved (T8)", d)
 		} else {
-			fail(37, "isolation.d: cross-instance isolation", strings.Join(msgs, " | "), d)
+			fail(38, "isolation.d: cross-instance isolation", strings.Join(msgs, " | "), d)
 		}
 	}
 
-	// 38 — T9: destroy cleans up isolation chain and rules directory
+	// 39 — T9: destroy cleans up isolation chain and rules directory
 	if isoOK {
 		start := time.Now()
 		var msgs []string
@@ -1641,13 +1692,13 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 
 		d := time.Since(start)
 		if len(msgs) == 0 {
-			pass(38, "isolation.d: destroy cleans up chain and rules dir (T9)", d)
+			pass(39, "isolation.d: destroy cleans up chain and rules dir (T9)", d)
 		} else {
-			fail(38, "isolation.d: destroy cleanup", strings.Join(msgs, " | "), d)
+			fail(39, "isolation.d: destroy cleanup", strings.Join(msgs, " | "), d)
 		}
 	}
 
-	// 39 — T10: isolation survives reboot
+	// 40 — T10: isolation survives reboot
 	//
 	// Re-create instance A with isolation rules, reboot the host, verify
 	// the chain is automatically recreated by the systemd service.
@@ -1747,9 +1798,9 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 
 		d := time.Since(start)
 		if len(msgs) == 0 {
-			pass(39, "isolation.d: chain survives reboot (T10)", d)
+			pass(40, "isolation.d: chain survives reboot (T10)", d)
 		} else {
-			fail(39, "isolation.d: reboot persistence", strings.Join(msgs, " | "), d)
+			fail(40, "isolation.d: reboot persistence", strings.Join(msgs, " | "), d)
 		}
 	}
 
@@ -1779,12 +1830,12 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 			btrfsImg, btrfsImg, btrfsMnt, btrfsImg, btrfsMnt,
 		))
 		if code != 0 {
-			fmt.Printf("[SKIP] BTRFS setup failed: %s — skipping tests 40-42\n", strings.TrimSpace(se))
+			fmt.Printf("[SKIP] BTRFS setup failed: %s — skipping tests 41-43\n", strings.TrimSpace(se))
 			btrfsOK = false
 		}
 	}
 
-	// 39 — BTRFS bind mount with standard runc (baseline — should always work)
+	// 40 — BTRFS bind mount with standard runc (baseline — should always work)
 	if btrfsOK {
 		start := time.Now()
 		testDir := btrfsMnt + "/runc-test"
@@ -1798,15 +1849,15 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		))
 		d := time.Since(start)
 		if code == 0 && strings.Contains(out, "btrfs-runc-ok") {
-			pass(40, "BTRFS bind mount with runc (baseline)", d)
+			pass(41, "BTRFS bind mount with runc (baseline)", d)
 		} else {
-			fail(40, "BTRFS bind mount with runc (baseline)", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
+			fail(41, "BTRFS bind mount with runc (baseline)", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
 			btrfsOK = false
 		}
 		run(client, fmt.Sprintf("sudo rm -rf %s", testDir))
 	}
 
-	// 40 — BTRFS bind mount with sysbox-runc (the bug case: EOVERFLOW on chmod)
+	// 41 — BTRFS bind mount with sysbox-runc (the bug case: EOVERFLOW on chmod)
 	// Sysbox uses ID-mapped mounts; BTRFS_SUPER_MAGIC was missing from the
 	// blacklist, causing chmod on the mountpoint to fail with EOVERFLOW.
 	// See: https://github.com/thieso2/sysbox/issues/12
@@ -1823,14 +1874,14 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		))
 		d := time.Since(start)
 		if code == 0 && strings.Contains(out, "btrfs-sysbox-ok") {
-			pass(41, "BTRFS bind mount with sysbox (chmod+touch on mountpoint)", d)
+			pass(42, "BTRFS bind mount with sysbox (chmod+touch on mountpoint)", d)
 		} else {
-			fail(41, "BTRFS bind mount with sysbox (chmod+touch on mountpoint)", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
+			fail(42, "BTRFS bind mount with sysbox (chmod+touch on mountpoint)", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
 		}
 		run(client, fmt.Sprintf("sudo rm -rf %s", testDir))
 	}
 
-	// 41 — BTRFS subvolume bind mount with sysbox-runc
+	// 42 — BTRFS subvolume bind mount with sysbox-runc
 	if btrfsOK {
 		start := time.Now()
 		subvol := btrfsMnt + "/subvol-test"
@@ -1846,9 +1897,9 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 		))
 		d := time.Since(start)
 		if code == 0 && strings.Contains(out, "btrfs-subvol-ok") {
-			pass(42, "BTRFS subvolume bind mount with sysbox", d)
+			pass(43, "BTRFS subvolume bind mount with sysbox", d)
 		} else {
-			fail(42, "BTRFS subvolume bind mount with sysbox", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
+			fail(43, "BTRFS subvolume bind mount with sysbox", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
 		}
 
 		// Clean up: delete subvolume (or dir fallback), then unmount + remove image
@@ -1971,7 +2022,7 @@ func runBtrfsOnly(client *ssh.Client) {
 		}
 	}
 
-	// 39 — BTRFS bind mount with runc (baseline)
+	// 40 — BTRFS bind mount with runc (baseline)
 	{
 		start := time.Now()
 		testDir := btrfsMnt + "/runc-test"
@@ -1984,14 +2035,14 @@ func runBtrfsOnly(client *ssh.Client) {
 		))
 		d := time.Since(start)
 		if code == 0 && strings.Contains(out, "btrfs-runc-ok") {
-			pass(40, "BTRFS bind mount with runc (baseline)", d)
+			pass(41, "BTRFS bind mount with runc (baseline)", d)
 		} else {
-			fail(40, "BTRFS bind mount with runc (baseline)", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
+			fail(41, "BTRFS bind mount with runc (baseline)", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
 		}
 		run(client, fmt.Sprintf("sudo rm -rf %s", testDir))
 	}
 
-	// 40 — BTRFS bind mount with sysbox-runc (the bug case)
+	// 41 — BTRFS bind mount with sysbox-runc (the bug case)
 	{
 		start := time.Now()
 		testDir := btrfsMnt + "/sysbox-test"
@@ -2004,14 +2055,14 @@ func runBtrfsOnly(client *ssh.Client) {
 		))
 		d := time.Since(start)
 		if code == 0 && strings.Contains(out, "btrfs-sysbox-ok") {
-			pass(41, "BTRFS bind mount with sysbox (chmod+touch on mountpoint)", d)
+			pass(42, "BTRFS bind mount with sysbox (chmod+touch on mountpoint)", d)
 		} else {
-			fail(41, "BTRFS bind mount with sysbox (chmod+touch on mountpoint)", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
+			fail(42, "BTRFS bind mount with sysbox (chmod+touch on mountpoint)", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
 		}
 		run(client, fmt.Sprintf("sudo rm -rf %s", testDir))
 	}
 
-	// 41 — BTRFS subvolume bind mount with sysbox-runc
+	// 42 — BTRFS subvolume bind mount with sysbox-runc
 	{
 		start := time.Now()
 		subvol := btrfsMnt + "/subvol-test"
@@ -2025,9 +2076,9 @@ func runBtrfsOnly(client *ssh.Client) {
 		))
 		d := time.Since(start)
 		if code == 0 && strings.Contains(out, "btrfs-subvol-ok") {
-			pass(42, "BTRFS subvolume bind mount with sysbox", d)
+			pass(43, "BTRFS subvolume bind mount with sysbox", d)
 		} else {
-			fail(42, "BTRFS subvolume bind mount with sysbox", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
+			fail(43, "BTRFS subvolume bind mount with sysbox", fmt.Sprintf("exit=%d stderr=%s", code, strings.TrimSpace(se)), d)
 		}
 		run(client, fmt.Sprintf("sudo btrfs subvolume delete %s 2>/dev/null; sudo rm -rf %s 2>/dev/null; true", subvol, subvol))
 	}
@@ -2130,7 +2181,7 @@ func main() {
 
 	total := len(results) // in focused mode, count only what ran
 	if *onlyFlag == "" {
-		total = 41 // full suite expected count
+		total = 42 // full suite expected count
 	}
 	passed := 0
 	for _, r := range results {
