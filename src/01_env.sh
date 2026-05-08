@@ -43,6 +43,7 @@ derive_vars() {
     DOCKYARD_FIXED_CIDR="${DOCKYARD_FIXED_CIDR:-172.30.0.0/24}"
     DOCKYARD_POOL_BASE="${DOCKYARD_POOL_BASE:-172.31.0.0/16}"
     DOCKYARD_POOL_SIZE="${DOCKYARD_POOL_SIZE:-24}"
+    DOCKYARD_SYSBOX_MGR_EXTRA_ARGS="${DOCKYARD_SYSBOX_MGR_EXTRA_ARGS:-${SYSBOX_MGR_EXTRA_ARGS:-}}"
 
     BIN_DIR="${DOCKYARD_ROOT}/bin"
     ETC_DIR="${DOCKYARD_ROOT}/etc"
@@ -62,4 +63,10 @@ derive_vars() {
     # Per-instance sysbox daemons (separate sysbox-mgr + sysbox-fs per installation)
     SYSBOX_RUN_DIR="${DOCKYARD_ROOT}/run/sysbox"
     SYSBOX_DATA_DIR="${DOCKYARD_ROOT}/lib/sysbox"
+
+    # Optional deterministic subuid/subgid range reservation for installers that
+    # pin a common sysbox user namespace mapping.
+    DOCKYARD_SYSBOX_SUBID_USER="${DOCKYARD_SYSBOX_SUBID_USER:-$INSTANCE_USER}"
+    DOCKYARD_SYSBOX_SUBID_START="${DOCKYARD_SYSBOX_SUBID_START:-}"
+    DOCKYARD_SYSBOX_SUBID_COUNT="${DOCKYARD_SYSBOX_SUBID_COUNT:-}"
 }

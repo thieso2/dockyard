@@ -32,6 +32,12 @@ cmd_create() {
     echo "  DOCKYARD_FIXED_CIDR:    ${DOCKYARD_FIXED_CIDR}"
     echo "  DOCKYARD_POOL_BASE:     ${DOCKYARD_POOL_BASE}"
     echo "  DOCKYARD_POOL_SIZE:     ${DOCKYARD_POOL_SIZE}"
+    if [ -n "${DOCKYARD_SYSBOX_MGR_EXTRA_ARGS:-}" ]; then
+        echo "  sysbox-mgr extra args: ${DOCKYARD_SYSBOX_MGR_EXTRA_ARGS}"
+    fi
+    if [ -n "${DOCKYARD_SYSBOX_SUBID_START:-}${DOCKYARD_SYSBOX_SUBID_COUNT:-}" ]; then
+        echo "  sysbox subid range:    ${DOCKYARD_SYSBOX_SUBID_USER}:${DOCKYARD_SYSBOX_SUBID_START}:${DOCKYARD_SYSBOX_SUBID_COUNT}"
+    fi
     echo ""
     echo "  bridge:      ${BRIDGE}"
     echo "  service:     ${SERVICE_NAME}.service"
@@ -60,7 +66,7 @@ cmd_create() {
     #   called for sandbox containers, so this version does NOT trigger the
     #   sysbox procfs incompatibility (nestybox/sysbox#973).
     #
-    # SYSBOX_VERSION: 0.6.7.10-tc is a patched fork (github.com/thieso2/sysbox)
+    # SYSBOX_VERSION: 0.7.0.6-tc is a patched fork (github.com/thieso2/sysbox)
     #   that adds --run-dir to sysbox-mgr, sysbox-fs, and sysbox-runc, allowing
     #   N independent sysbox instances per host (each with its own socket dir).
     #   SetRunDir() calls os.Setenv("SYSBOX_RUN_DIR", dir) and os.Args is scanned
@@ -69,9 +75,8 @@ cmd_create() {
     #   No wrapper script needed.
     #   Fixed: https://github.com/thieso2/sysbox/issues/5
     #   Distributed as a static tarball (no .deb, no dpkg dependency).
-    #   0.6.7.10-tc is the first release with an aarch64 static tarball.
-    #   NOTE: 0.7.0.1-tc has a netns regression — do not upgrade until fixed
-    #   (see https://github.com/thieso2/sysbox/issues/9)
+    #   0.7.0.6-tc includes the netns regression fix tracked in:
+    #   https://github.com/thieso2/sysbox/issues/9
 
     # --- Detect CPU architecture ---
     local ARCH
@@ -135,6 +140,8 @@ cmd_create() {
     else
         echo "  User ${INSTANCE_USER} already exists"
     fi
+
+    configure_sysbox_subids
 
     # Allow sysbox-fs FUSE mounts at this instance's sysbox mountpoint.
     # The default fusermount3 AppArmor profile (tightened in Ubuntu 25.10+)

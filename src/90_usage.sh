@@ -58,6 +58,12 @@ Override any variable via environment:
   DOCKYARD_FIXED_CIDR     Container subnet (default: derived from bridge)
   DOCKYARD_POOL_BASE      Address pool base (default: random from 172.16.0.0/12)
   DOCKYARD_POOL_SIZE      Pool subnet size (default: 24)
+  DOCKYARD_SYSBOX_MGR_EXTRA_ARGS
+                          Optional sysbox-mgr flags appended at startup
+  DOCKYARD_SYSBOX_SUBID_USER
+                          User for optional /etc/subuid and /etc/subgid reservation
+  DOCKYARD_SYSBOX_SUBID_START / DOCKYARD_SYSBOX_SUBID_COUNT
+                          Optional deterministic subuid/subgid range
 
 Examples:
   ./dockyard.sh gen-env

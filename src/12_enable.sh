@@ -10,6 +10,9 @@ cmd_enable() {
 
     echo "Installing ${SERVICE_NAME}.service (with per-instance sysbox)..."
 
+    local sysbox_mgr_extra_args_escaped
+    printf -v sysbox_mgr_extra_args_escaped '%q' "${DOCKYARD_SYSBOX_MGR_EXTRA_ARGS:-}"
+
     # Write the stack script (bakes all paths in at install time; no env file at runtime)
     cat > "${BIN_DIR}/dockyard-stack" <<STACKEOF
 #!/bin/bash
@@ -19,6 +22,7 @@ MGR_PID=""
 FS_PID=""
 CTR_PID=""
 DOCKERD_PID=""
+SYSBOX_MGR_EXTRA_ARGS=${sysbox_mgr_extra_args_escaped}
 
 wait_for_socket() {
     local sock="\$1" pid="\$2" name="\$3" i=0
@@ -49,7 +53,12 @@ cleanup() {
 trap 'cleanup 0' TERM INT
 
 # --- Start sysbox-mgr ---
-${BIN_DIR}/sysbox-mgr --run-dir ${SYSBOX_RUN_DIR} --data-root ${SYSBOX_DATA_DIR} \
+SYSBOX_MGR_ARGS=(--run-dir "${SYSBOX_RUN_DIR}" --data-root "${SYSBOX_DATA_DIR}")
+if [ -n "\$SYSBOX_MGR_EXTRA_ARGS" ]; then
+    read -r -a EXTRA_SYSBOX_MGR_ARGS <<< "\$SYSBOX_MGR_EXTRA_ARGS"
+    SYSBOX_MGR_ARGS+=("\${EXTRA_SYSBOX_MGR_ARGS[@]}")
+fi
+${BIN_DIR}/sysbox-mgr "\${SYSBOX_MGR_ARGS[@]}" \
     >>${LOG_DIR}/sysbox-mgr.log 2>&1 &
 MGR_PID=\$!
 echo "\$MGR_PID" > ${SYSBOX_RUN_DIR}/sysbox-mgr.pid
@@ -170,7 +179,7 @@ ExecStopPost=-/bin/bash -c 'iptables -D FORWARD -i ${BRIDGE} -o ${BRIDGE} -j ACC
 ExecStopPost=-/bin/bash -c 'iptables -D FORWARD -s ${DOCKYARD_POOL_BASE} -j ACCEPT 2>/dev/null; iptables -D FORWARD -d ${DOCKYARD_POOL_BASE} -j ACCEPT 2>/dev/null; iptables -t nat -D POSTROUTING -s ${DOCKYARD_POOL_BASE} -j MASQUERADE 2>/dev/null'
 
 # Remove per-instance isolation chain and its jump rules
-ExecStopPost=-/bin/bash -c 'for br in \$(ip -o link show type bridge 2>/dev/null | grep -oP "br-[0-9a-f]+"); do iptables -D FORWARD -i "\$br" -o "\$br" -j ${ISO_CHAIN} 2>/dev/null; done; iptables -F ${ISO_CHAIN} 2>/dev/null; iptables -X ${ISO_CHAIN} 2>/dev/null'
+ExecStopPost=-/bin/bash -c 'iptables -S FORWARD 2>/dev/null | grep -F " -j ${ISO_CHAIN}" | sed "s/^-A /-D /" | while IFS= read -r rule; do iptables \$rule 2>/dev/null || true; done; iptables -F ${ISO_CHAIN} 2>/dev/null; iptables -X ${ISO_CHAIN} 2>/dev/null'
 
 # Remove bridge
 ExecStopPost=-/bin/bash -c 'if ip link show ${BRIDGE} &>/dev/null; then ip link set ${BRIDGE} down 2>/dev/null; ip link delete ${BRIDGE} 2>/dev/null; fi'

@@ -94,7 +94,7 @@ This is a generic hook — dockyard itself never writes `.rules` files.
 
 There is no flag to change them. Running two sysbox-mgr processes on the same host is physically impossible — they fight over the same socket file. An earlier architecture worked around this by using a single shared `dockyard-sysbox.service`, but that means all instances share one sysbox process.
 
-**The solution: fork sysbox.** The fork (`github.com/thieso2/sysbox`, version `0.6.7.10-tc`) adds `--run-dir <dir>` to all three sysbox binaries — `sysbox-mgr`, `sysbox-fs`, and `sysbox-runc`. `SetRunDir()` calls `os.Setenv("SYSBOX_RUN_DIR", dir)`, so passing `--run-dir` via `runtimeArgs` in `daemon.json` works correctly for all sockets including the seccomp tracer. No wrapper script is needed.
+**The solution: fork sysbox.** The fork (`github.com/thieso2/sysbox`, version `0.7.0.6-tc`) adds `--run-dir <dir>` to all three sysbox binaries — `sysbox-mgr`, `sysbox-fs`, and `sysbox-runc`. `SetRunDir()` calls `os.Setenv("SYSBOX_RUN_DIR", dir)`, so passing `--run-dir` via `runtimeArgs` in `daemon.json` works correctly for all sockets including the seccomp tracer. No wrapper script is needed.
 
 Each dockyard instance points its sysbox pair at its own directories (FHS layout):
 
@@ -105,7 +105,11 @@ ${DOCKYARD_ROOT}/lib/sysbox/    sysbox-mgr data-root + sysbox-fs mountpoint
 
 All three sysbox binaries are per-instance inside `${BIN_DIR}/` (`${DOCKYARD_ROOT}/bin/`).
 
-**Lifecycle.** sysbox-mgr and sysbox-fs start as `ExecStartPre` steps inside the per-instance docker service and are killed in `ExecStopPost`. There is no shared service and no ref-counting. Destroying any instance affects only its own sysbox processes.
+**Lifecycle.** sysbox-mgr and sysbox-fs start from the per-instance `dockyard-stack` script before containerd and dockerd. There is no shared service and no ref-counting. Destroying any instance affects only its own sysbox processes.
+
+**Optional common user namespace mapping.** Dockyard normally leaves sysbox's default per-container user namespace allocation intact. Installers that need stable ownership across containers sharing the same bind mounts can set `DOCKYARD_SYSBOX_MGR_EXTRA_ARGS` to append sysbox-mgr flags and can set `DOCKYARD_SYSBOX_SUBID_USER`, `DOCKYARD_SYSBOX_SUBID_START`, and `DOCKYARD_SYSBOX_SUBID_COUNT` to reserve a deterministic range in `/etc/subuid` and `/etc/subgid`.
+
+This mode is opt-in because a common mapping trades away some of sysbox's per-container user namespace isolation. It is for cases where shared persistent volume semantics are more important than each container receiving a distinct host ID range.
 
 ---
 
@@ -127,7 +131,7 @@ Versions are pinned explicitly in `cmd_create()`:
 | Docker CE static | 29.2.1 | download.docker.com |
 | Docker Rootless Extras | 29.2.1 | download.docker.com |
 | Docker Compose v2 | 2.32.4 | github.com/docker/compose |
-| Sysbox fork (static tarball) | 0.6.7.10-tc | github.com/thieso2/sysbox |
+| Sysbox fork (static tarball) | 0.7.0.6-tc | github.com/thieso2/sysbox |
 
 ---
 
@@ -191,7 +195,7 @@ bin/ present at root?"]
     G -->|"clear"| I["Write dockyard.env"]
 ```
 
-All six variables (`DOCKYARD_ROOT`, `DOCKYARD_DOCKER_PREFIX`, `DOCKYARD_BRIDGE_CIDR`, `DOCKYARD_FIXED_CIDR`, `DOCKYARD_POOL_BASE`, `DOCKYARD_POOL_SIZE`) can be overridden via environment variables. `--nocheck` skips collision detection for scripted use.
+The six required variables (`DOCKYARD_ROOT`, `DOCKYARD_DOCKER_PREFIX`, `DOCKYARD_BRIDGE_CIDR`, `DOCKYARD_FIXED_CIDR`, `DOCKYARD_POOL_BASE`, `DOCKYARD_POOL_SIZE`) can be overridden via environment variables. `gen-env` also emits optional sysbox controls for sysbox-mgr passthrough flags and deterministic subid reservations. `--nocheck` skips collision detection for scripted use.
 
 ---
 
@@ -239,7 +243,7 @@ sequenceDiagram
     participant CT as containerd
     participant DK as dockerd
 
-    SD->>SM: ExecStartPre: sysbox-mgr --run-dir run/sysbox
+    SD->>SM: dockyard-stack starts sysbox-mgr --run-dir run/sysbox [extra args]
     SM-->>SD: run/sysbox/sysmgr.sock ready
 
     SD->>SF: ExecStartPre: sysbox-fs --run-dir run/sysbox

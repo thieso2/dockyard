@@ -1580,18 +1580,17 @@ func runTests(client *ssh.Client, host string, port int, user, keyPath string) {
 			if strings.Contains(out, "#") {
 				msgs = append(msgs, "comment artifacts in chain rules")
 			}
-			// Count ACCEPT rules: should be exactly 4 (src+dst for each IP)
-			// plus ESTABLISHED,RELATED. Lines with ACCEPT:
-			acceptCount := 0
+			// Count only the ACCEPT rules produced from this file. The chain may
+			// also contain bridge subnet ACCEPT rules for same-bridge traffic.
+			commentRuleCount := 0
 			for _, line := range strings.Split(out, "\n") {
-				if strings.Contains(line, "ACCEPT") {
-					acceptCount++
+				if strings.Contains(line, "ACCEPT") &&
+					(strings.Contains(line, "10.0.0.1") || strings.Contains(line, "10.0.0.2")) {
+					commentRuleCount++
 				}
 			}
-			// Expected: 1 (ESTABLISHED,RELATED) + 2 (src 10.0.0.1) + 2 (dst 10.0.0.1) wait no...
-			// Actually: ESTABLISHED,RELATED + src 10.0.0.1 + dst 10.0.0.1 + src 10.0.0.2 + dst 10.0.0.2 = 5
-			if acceptCount != 5 {
-				msgs = append(msgs, fmt.Sprintf("expected 5 ACCEPT rules, got %d", acceptCount))
+			if commentRuleCount != 4 {
+				msgs = append(msgs, fmt.Sprintf("expected 4 comment-file ACCEPT rules, got %d", commentRuleCount))
 			}
 		}
 
@@ -2181,7 +2180,7 @@ func main() {
 
 	total := len(results) // in focused mode, count only what ran
 	if *onlyFlag == "" {
-		total = 42 // full suite expected count
+		total = 43 // full suite expected count
 	}
 	passed := 0
 	for _, r := range results {

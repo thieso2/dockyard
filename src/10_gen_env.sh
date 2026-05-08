@@ -21,6 +21,10 @@ cmd_gen_env() {
     local root="${DOCKYARD_ROOT:-/dockyard}"
     local prefix="${DOCKYARD_DOCKER_PREFIX:-dy_}"
     local pool_size="${DOCKYARD_POOL_SIZE:-24}"
+    local sysbox_mgr_extra_args="${DOCKYARD_SYSBOX_MGR_EXTRA_ARGS:-${SYSBOX_MGR_EXTRA_ARGS:-}}"
+    local sysbox_subid_user="${DOCKYARD_SYSBOX_SUBID_USER:-${prefix}docker}"
+    local sysbox_subid_start="${DOCKYARD_SYSBOX_SUBID_START:-}"
+    local sysbox_subid_count="${DOCKYARD_SYSBOX_SUBID_COUNT:-}"
 
     # Generate random networks if not provided via env
     local bridge_cidr="${DOCKYARD_BRIDGE_CIDR:-}"
@@ -87,6 +91,18 @@ cmd_gen_env() {
         check_root_conflict "$root" || exit 1
     fi
 
+    if [ -n "${sysbox_subid_start}${sysbox_subid_count}" ]; then
+        if [ -z "$sysbox_subid_start" ] || [ -z "$sysbox_subid_count" ]; then
+            echo "Error: DOCKYARD_SYSBOX_SUBID_START and DOCKYARD_SYSBOX_SUBID_COUNT must be set together." >&2
+            exit 1
+        fi
+        validate_uint "$sysbox_subid_start" "DOCKYARD_SYSBOX_SUBID_START" || exit 1
+        validate_uint "$sysbox_subid_count" "DOCKYARD_SYSBOX_SUBID_COUNT" || exit 1
+    fi
+
+    local quoted_sysbox_mgr_extra_args
+    printf -v quoted_sysbox_mgr_extra_args '%q' "$sysbox_mgr_extra_args"
+
     # Write config file
     cat > "$out_file" <<EOF
 # Dockyard configuration
@@ -98,6 +114,15 @@ DOCKYARD_BRIDGE_CIDR=${bridge_cidr}
 DOCKYARD_FIXED_CIDR=${fixed_cidr}
 DOCKYARD_POOL_BASE=${pool_base}
 DOCKYARD_POOL_SIZE=${pool_size}
+
+# Optional sysbox controls. Extra args are split on whitespace and appended to sysbox-mgr.
+DOCKYARD_SYSBOX_MGR_EXTRA_ARGS=${quoted_sysbox_mgr_extra_args}
+
+# Optional deterministic /etc/subuid and /etc/subgid reservation.
+# Set START and COUNT together to have create replace this user's range.
+DOCKYARD_SYSBOX_SUBID_USER=${sysbox_subid_user}
+DOCKYARD_SYSBOX_SUBID_START=${sysbox_subid_start}
+DOCKYARD_SYSBOX_SUBID_COUNT=${sysbox_subid_count}
 EOF
 
     echo "Generated ${out_file}:"

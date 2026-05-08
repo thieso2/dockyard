@@ -35,7 +35,13 @@ cmd_start() {
     mkdir -p "$SYSBOX_RUN_DIR" "$SYSBOX_DATA_DIR"
 
     echo "Starting sysbox-mgr..."
-    "${BIN_DIR}/sysbox-mgr" --run-dir "${SYSBOX_RUN_DIR}" --data-root "${SYSBOX_DATA_DIR}" \
+    local -a sysbox_mgr_args=(--run-dir "${SYSBOX_RUN_DIR}" --data-root "${SYSBOX_DATA_DIR}")
+    if [ -n "${DOCKYARD_SYSBOX_MGR_EXTRA_ARGS:-}" ]; then
+        local -a extra_sysbox_mgr_args=()
+        read -r -a extra_sysbox_mgr_args <<< "$DOCKYARD_SYSBOX_MGR_EXTRA_ARGS"
+        sysbox_mgr_args+=("${extra_sysbox_mgr_args[@]}")
+    fi
+    "${BIN_DIR}/sysbox-mgr" "${sysbox_mgr_args[@]}" \
         &>"${LOG_DIR}/sysbox-mgr.log" &
     SYSBOX_MGR_PID=$!
     echo "$SYSBOX_MGR_PID" > "${SYSBOX_RUN_DIR}/sysbox-mgr.pid"

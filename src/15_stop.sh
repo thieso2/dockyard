@@ -23,9 +23,12 @@ cmd_stop() {
 
     # Remove per-instance isolation chain and its jump rules
     local iso_chain="DOCKYARD-ISO-${DOCKYARD_DOCKER_PREFIX%_}"
-    for br in $(ip -o link show type bridge 2>/dev/null | grep -oP 'br-[0-9a-f]+'); do
-        iptables -D FORWARD -i "$br" -o "$br" -j "$iso_chain" 2>/dev/null || true
-    done
+    iptables -S FORWARD 2>/dev/null |
+        grep -F " -j ${iso_chain}" |
+        sed "s/^-A /-D /" |
+        while IFS= read -r rule; do
+            iptables $rule 2>/dev/null || true
+        done || true
     iptables -F "$iso_chain" 2>/dev/null || true
     iptables -X "$iso_chain" 2>/dev/null || true
 

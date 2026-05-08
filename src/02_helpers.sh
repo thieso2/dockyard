@@ -161,6 +161,65 @@ detect_upstream_dns() {
     echo "${out% }"
 }
 
+validate_uint() {
+    local value="$1"
+    local label="$2"
+
+    if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+        echo "Error: ${label} must be a positive integer (got '${value}')" >&2
+        return 1
+    fi
+    if (( 10#$value == 0 )); then
+        echo "Error: ${label} must be greater than zero" >&2
+        return 1
+    fi
+}
+
+configure_subid_file() {
+    local path="$1"
+    local user="$2"
+    local start="$3"
+    local count="$4"
+    local tmp
+
+    touch "$path"
+    chmod 0644 "$path"
+
+    {
+        flock -x 9
+        tmp=$(mktemp "${path}.dockyard.XXXXXX")
+        awk -F: -v user="$user" '$1 != user { print }' "$path" > "$tmp"
+        printf '%s:%s:%s\n' "$user" "$start" "$count" >> "$tmp"
+        chmod 0644 "$tmp"
+        mv "$tmp" "$path"
+    } 9>"${path}.lock"
+}
+
+configure_sysbox_subids() {
+    local start="${DOCKYARD_SYSBOX_SUBID_START:-}"
+    local count="${DOCKYARD_SYSBOX_SUBID_COUNT:-}"
+    local user="${DOCKYARD_SYSBOX_SUBID_USER:-$INSTANCE_USER}"
+
+    if [ -z "${start}${count}" ]; then
+        return 0
+    fi
+    if [ -z "$start" ] || [ -z "$count" ]; then
+        echo "Error: DOCKYARD_SYSBOX_SUBID_START and DOCKYARD_SYSBOX_SUBID_COUNT must be set together." >&2
+        exit 1
+    fi
+    if [ -z "$user" ]; then
+        echo "Error: DOCKYARD_SYSBOX_SUBID_USER must not be empty." >&2
+        exit 1
+    fi
+
+    validate_uint "$start" "DOCKYARD_SYSBOX_SUBID_START" || exit 1
+    validate_uint "$count" "DOCKYARD_SYSBOX_SUBID_COUNT" || exit 1
+
+    configure_subid_file /etc/subuid "$user" "$start" "$count"
+    configure_subid_file /etc/subgid "$user" "$start" "$count"
+    echo "  Configured subuid/subgid ${user}:${start}:${count}"
+}
+
 wait_for_file() {
     local file="$1"
     local label="$2"
